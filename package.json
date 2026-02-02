@@ -1,0 +1,76 @@
+{
+  "name": "openclaw-redis-agent-memory",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin for long-term AI agent memory using Redis vector search",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "install": {
+      "npmSpec": "openclaw-redis-agent-memory"
+    }
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "memory",
+    "long-term-memory",
+    "redis",
+    "vector-search",
+    "openclaw",
+    "plugin"
+  ],
+  "author": "Andrew Brookins <a@andrewbrookins.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/redis-developer/openclaw-redis-agent-memory.git"
+  },
+  "homepage": "https://github.com/redis-developer/openclaw-redis-agent-memory#readme",
+  "bugs": {
+    "url": "https://github.com/redis-developer/openclaw-redis-agent-memory/issues"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0",
+    "agent-memory-client": "^0.3.1"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2025.0.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+

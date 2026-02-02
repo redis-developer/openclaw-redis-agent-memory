@@ -1,0 +1,138 @@
+{
+  "id": "redis-memory",
+  "kind": "memory",
+  "uiHints": {
+    "serverUrl": {
+      "label": "Server URL",
+      "placeholder": "http://localhost:8000",
+      "help": "Base URL of the agent-memory-server (or use ${AGENT_MEMORY_SERVER_URL})"
+    },
+    "apiKey": {
+      "label": "API Key",
+      "sensitive": true,
+      "placeholder": "your-api-key",
+      "help": "API key for authentication (optional, or use ${AGENT_MEMORY_API_KEY})"
+    },
+    "bearerToken": {
+      "label": "Bearer Token",
+      "sensitive": true,
+      "placeholder": "your-bearer-token",
+      "help": "Bearer token for authentication (optional)",
+      "advanced": true
+    },
+    "namespace": {
+      "label": "Namespace",
+      "placeholder": "default",
+      "help": "Namespace for organizing memories (isolates memories by project/app)"
+    },
+    "userId": {
+      "label": "User ID",
+      "placeholder": "default",
+      "help": "User ID for memory isolation (each user gets their own memories)"
+    },
+    "timeout": {
+      "label": "Timeout (ms)",
+      "placeholder": "30000",
+      "advanced": true
+    },
+    "autoCapture": {
+      "label": "Auto-Capture",
+      "help": "Automatically capture important information from conversations"
+    },
+    "autoRecall": {
+      "label": "Auto-Recall",
+      "help": "Automatically inject relevant memories into context"
+    },
+    "minScore": {
+      "label": "Minimum Score",
+      "placeholder": "0.3",
+      "help": "Minimum similarity score for memory recall (0-1)",
+      "advanced": true
+    },
+    "recallLimit": {
+      "label": "Recall Limit",
+      "placeholder": "3",
+      "help": "Maximum number of memories to recall",
+      "advanced": true
+    },
+    "extractionStrategy": {
+      "label": "Extraction Strategy",
+      "placeholder": "discrete",
+      "help": "How to extract memories: discrete (semantic/episodic), summary, preferences, or custom",
+      "advanced": true
+    },
+    "customPrompt": {
+      "label": "Custom Extraction Prompt",
+      "placeholder": "Extract action items and decisions from this conversation.",
+      "help": "Custom prompt for memory extraction (only used with 'custom' strategy)",
+      "advanced": true
+    },
+    "summaryViewName": {
+      "label": "Summary View Name",
+      "placeholder": "agent_user_summary",
+      "help": "Name for the rolling summary view of long-term memories",
+      "advanced": true
+    },
+    "summaryTimeWindowDays": {
+      "label": "Summary Time Window (days)",
+      "placeholder": "30",
+      "help": "Rolling window in days for the summary view (only recent memories included)",
+      "advanced": true
+    },
+    "summaryGroupBy": {
+      "label": "Summary Group By",
+      "placeholder": "user_id",
+      "help": "Fields to partition summaries by: user_id, namespace, or both",
+      "advanced": true
+    },
+    "recallDescription": {
+      "label": "Recall Tool Description",
+      "placeholder": "Search through long-term memories. Use when you need context about user preferences, past decisions, or previously discussed topics.",
+      "help": "Description shown to the LLM for the memory_recall tool",
+      "advanced": true
+    },
+    "storeDescription": {
+      "label": "Store Tool Description",
+      "placeholder": "Save important information in long-term memory. Use for preferences, facts, decisions.",
+      "help": "Description shown to the LLM for the memory_store tool",
+      "advanced": true
+    },
+    "forgetDescription": {
+      "label": "Forget Tool Description",
+      "placeholder": "Delete specific memories. GDPR-compliant.",
+      "help": "Description shown to the LLM for the memory_forget tool",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "serverUrl": { "type": "string" },
+      "apiKey": { "type": "string" },
+      "bearerToken": { "type": "string" },
+      "namespace": { "type": "string" },
+      "userId": { "type": "string" },
+      "timeout": { "type": "number" },
+      "autoCapture": { "type": "boolean" },
+      "autoRecall": { "type": "boolean" },
+      "minScore": { "type": "number", "minimum": 0, "maximum": 1 },
+      "recallLimit": { "type": "number", "minimum": 1 },
+      "extractionStrategy": {
+        "type": "string",
+        "enum": ["discrete", "summary", "preferences", "custom"]
+      },
+      "customPrompt": { "type": "string" },
+      "summaryViewName": { "type": "string" },
+      "summaryTimeWindowDays": { "type": "number", "minimum": 1 },
+      "summaryGroupBy": {
+        "type": "array",
+        "items": { "type": "string", "enum": ["user_id", "namespace"] }
+      },
+      "recallDescription": { "type": "string" },
+      "storeDescription": { "type": "string" },
+      "forgetDescription": { "type": "string" }
+    }
+  }
+}
+
