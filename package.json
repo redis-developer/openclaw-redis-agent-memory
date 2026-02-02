@@ -24,6 +24,8 @@
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run clean && npm run build"
   },
   "openclaw": {
@@ -67,10 +69,10 @@
     }
   },
   "devDependencies": {
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^3.2.4"
   },
   "engines": {
     "node": ">=18.0.0"
   }
 }
-
