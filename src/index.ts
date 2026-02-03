@@ -31,10 +31,48 @@ import { Type } from "@sinclair/typebox";
 import { MemoryAPIClient, MemoryNotFoundError } from "agent-memory-client";
 import type { MemoryMessage } from "agent-memory-client";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 
 import { type MemoryConfig, memoryConfigSchema } from "./config.js";
 import type { PluginApi, PluginDefinition } from "./types.js";
 import { stringEnum } from "./types.js";
+
+// ============================================================================
+// Session Store Helpers
+// ============================================================================
+
+/**
+ * Read the sessionId from the OpenClaw session store.
+ *
+ * Session store is at: ~/.openclaw/agents/<agentId>/sessions/sessions.json
+ * Format: { "agent:main:main": { "sessionId": "uuid", ... }, ... }
+ */
+export function readSessionIdFromStore(sessionKey: string): string | null {
+  try {
+    // Extract agentId from sessionKey (e.g., "agent:main:main" -> "main")
+    const parts = sessionKey.split(":");
+    const agentId = parts.length >= 2 ? parts[1] : "main";
+
+    const storePath = path.join(os.homedir(), ".openclaw", "agents", agentId, "sessions", "sessions.json");
+
+    if (!fs.existsSync(storePath)) {
+      return null;
+    }
+
+    const data = JSON.parse(fs.readFileSync(storePath, "utf-8"));
+    const entry = data[sessionKey];
+
+    if (entry && typeof entry.sessionId === "string") {
+      return entry.sessionId;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 // ============================================================================
 // Types
@@ -106,9 +144,10 @@ function stripEnvelopeForSearch(text: string): string {
 }
 
 /**
- * Convert messages to MemoryMessage format for working memory
+ * Convert messages to MemoryMessage format for working memory.
+ * Preserves original timestamps from pi-ai messages to enable deduplication.
  */
-function convertToMemoryMessages(messages: unknown[]): MemoryMessage[] {
+export function convertToMemoryMessages(messages: unknown[]): MemoryMessage[] {
   const result: MemoryMessage[] = [];
 
   for (const msg of messages) {
@@ -127,11 +166,15 @@ function convertToMemoryMessages(messages: unknown[]): MemoryMessage[] {
     // Skip injected memory context
     if (content.includes("<relevant-memories>")) continue;
 
+    // Preserve original timestamp from pi-ai message (Unix ms), fallback to now
+    const msgTimestamp =
+      typeof msgObj.timestamp === "number" ? msgObj.timestamp : Date.now();
+
     result.push({
       role,
       content,
       id: typeof msgObj.id === "string" ? msgObj.id : randomUUID(),
-      created_at: new Date().toISOString(),
+      created_at: new Date(msgTimestamp).toISOString(),
     });
   }
 
@@ -449,6 +492,9 @@ const redisMemoryPlugin: PluginDefinition = {
 
     let summaryViewId: string | null = null;
 
+    // Track max message timestamp per session to avoid re-sending messages
+    const sessionMaxTimestamps = new Map<string, number>();
+
     async function ensureSummaryView(): Promise<string | null> {
       try {
         const views = await client.listSummaryViews();
@@ -490,14 +536,70 @@ const redisMemoryPlugin: PluginDefinition = {
     }
 
     // ========================================================================
+    // Session Tracking
+    // ========================================================================
+
+    /**
+     * Get the working memory session ID.
+     *
+     * Priority:
+     * 1. Config override (workingMemorySessionId) - for fixed continuous sessions
+     * 2. Try to read sessionId from OpenClaw session store -> sessionKey:sessionId
+     * 3. Fall back to sessionKey only -> continuous session across resets
+     *
+     * When we can't get the sessionId, we use sessionKey only, which means
+     * the working memory is continuous across session resets. The server
+     * will auto-compact/summarize over time.
+     */
+    function getWorkingMemorySessionId(sessionKey: string): string {
+      // 1. Config override takes priority
+      if (cfg.workingMemorySessionId) {
+        return cfg.workingMemorySessionId;
+      }
+
+      // 2. Try to read sessionId from OpenClaw session store
+      const sessionId = readSessionIdFromStore(sessionKey);
+      if (sessionId) {
+        return `${sessionKey}:${sessionId}`;
+      }
+
+      // 3. Fall back to sessionKey only (continuous session)
+      return sessionKey;
+    }
+
+    // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 
     // Auto-recall: inject rolling summary + query-specific memories before agent starts
     if (cfg.autoRecall) {
-      api.on("before_agent_start", async (event, _ctx) => {
+      api.on("before_agent_start", async (event, ctx) => {
         const e = event as { prompt?: string };
         if (!e.prompt || e.prompt.length < 5) return;
+
+        const sessionKey = ctx?.sessionKey ?? "default";
+
+        // Get the working memory session ID (includes sessionId from session store)
+        // This also detects and handles session resets automatically
+        const sessionId = getWorkingMemorySessionId(sessionKey);
+        try {
+          const wm = await client.getWorkingMemory(sessionId, {
+            namespace: cfg.namespace,
+          });
+          if (wm && wm.messages && wm.messages.length > 0) {
+            const maxTs = Math.max(
+              ...wm.messages.map((m) =>
+                m.created_at ? new Date(m.created_at).getTime() : 0,
+              ),
+            );
+            sessionMaxTimestamps.set(sessionId, maxTs);
+          } else {
+            sessionMaxTimestamps.delete(sessionId);
+          }
+        } catch (err) {
+          // New session or error - no existing messages
+          sessionMaxTimestamps.delete(sessionId);
+        }
 
         const contextParts: string[] = [];
 
@@ -586,16 +688,34 @@ const redisMemoryPlugin: PluginDefinition = {
     if (cfg.autoCapture) {
       api.on("agent_end", async (event, ctx) => {
         const e = event as { success?: boolean; messages?: unknown[] };
+
         if (!e.success || !e.messages || e.messages.length === 0) {
           return;
         }
 
         try {
-          const sessionId = ctx?.sessionKey ?? `session-${Date.now()}`;
-          const memoryMessages = convertToMemoryMessages(e.messages);
+          const sessionKey = ctx?.sessionKey ?? `session-${Date.now()}`;
 
-          if (memoryMessages.length === 0) {
-            api.logger.debug?.("redis-memory: no messages to capture");
+          // Get the working memory session ID (includes sessionId from session store)
+          const workingMemorySessionId = getWorkingMemorySessionId(sessionKey);
+
+          const allMemoryMessages = convertToMemoryMessages(e.messages);
+          if (allMemoryMessages.length === 0) {
+            return;
+          }
+
+          // Filter to only messages newer than what we had at turn start
+          // Note: use workingMemorySessionId for tracking since that's what we used in before_agent_start
+          const cutoffTs = sessionMaxTimestamps.get(workingMemorySessionId) ?? 0;
+          const newMessages = allMemoryMessages.filter((m) => {
+            const msgTs = m.created_at ? new Date(m.created_at).getTime() : 0;
+            return msgTs > cutoffTs;
+          });
+
+          // Clean up tracking for this session
+          sessionMaxTimestamps.delete(workingMemorySessionId);
+
+          if (newMessages.length === 0) {
             return;
           }
 
@@ -609,16 +729,13 @@ const redisMemoryPlugin: PluginDefinition = {
               }
             : undefined;
 
-          await client.putWorkingMemory(sessionId, {
-            messages: memoryMessages,
+          // Only include user_id if explicitly configured
+          await client.putWorkingMemory(workingMemorySessionId, {
+            messages: newMessages,
             namespace: cfg.namespace,
-            user_id: cfg.userId,
+            ...(cfg.userId ? { user_id: cfg.userId } : {}),
             long_term_memory_strategy: longTermMemoryStrategy,
           });
-
-          api.logger.info?.(
-            `redis-memory: saved ${memoryMessages.length} messages to working memory`,
-          );
 
           // Trigger async summary view refresh (non-blocking)
           if (summaryViewId) {

@@ -125,15 +125,46 @@ export type ServiceDefinition = {
 export type CliRegistration = (ctx: { program: unknown }) => void;
 
 /**
+ * Internal hook event (for command:new, command:reset, etc.)
+ */
+export type InternalHookEvent = {
+  type: "command" | "session" | "agent" | "gateway";
+  action: string;
+  sessionKey: string;
+  context: Record<string, unknown>;
+  timestamp: Date;
+  messages: string[];
+};
+
+/**
+ * Internal hook handler function type.
+ */
+export type InternalHookHandler = (event: InternalHookEvent) => Promise<void> | void;
+
+/**
  * Plugin API interface (compatible with OpenClaw's OpenClawPluginApi).
  */
 export type PluginApi = {
   logger: PluginLogger;
   pluginConfig?: Record<string, unknown>;
+  /** OpenClaw configuration (includes hooks.internal.enabled, etc.) */
+  config?: {
+    hooks?: {
+      internal?: {
+        enabled?: boolean;
+      };
+    };
+  };
   registerTool: (tool: ToolDefinition, opts?: { name?: string }) => void;
   registerCli?: (fn: CliRegistration, opts?: { commands?: string[] }) => void;
   registerService: (service: ServiceDefinition) => void;
   on: <E>(event: string, handler: HookHandler<E>) => void;
+  /** Register an internal hook handler (for command:new, command:reset, etc.) */
+  registerHook?: (
+    events: string | string[],
+    handler: InternalHookHandler,
+    opts?: { name?: string; description?: string },
+  ) => void;
 };
 
 /**
