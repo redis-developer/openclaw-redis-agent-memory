@@ -1,5 +1,8 @@
 # openclaw-redis-agent-memory
 
+[![npm version](https://img.shields.io/npm/v/openclaw-redis-agent-memory.svg)](https://www.npmjs.com/package/openclaw-redis-agent-memory)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) using Redis vector search.
 
 Give your AI agent persistent memory across conversations - it can remember user preferences, past decisions, important facts, and more.
