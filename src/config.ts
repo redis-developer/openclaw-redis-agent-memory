@@ -28,6 +28,12 @@ export type MemoryConfig = {
   namespace?: string;
   /** User ID for memory isolation (default: "default") */
   userId?: string;
+  /**
+   * Working memory session ID override.
+   * If set, uses this fixed session ID instead of deriving from OpenClaw session.
+   * Useful for maintaining a single continuous working memory across sessions.
+   */
+  workingMemorySessionId?: string;
   /** Request timeout in milliseconds (default: 30000) */
   timeout?: number;
   /** Enable auto-capture of important information from conversations */
@@ -97,6 +103,7 @@ const ALLOWED_CONFIG_KEYS = [
   "bearerToken",
   "namespace",
   "userId",
+  "workingMemorySessionId",
   "timeout",
   "autoCapture",
   "autoRecall",
@@ -163,7 +170,11 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
     bearerToken:
       typeof cfg.bearerToken === "string" ? resolveEnvVars(cfg.bearerToken) : undefined,
     namespace: typeof cfg.namespace === "string" ? cfg.namespace : DEFAULT_NAMESPACE,
-    userId: typeof cfg.userId === "string" ? cfg.userId : DEFAULT_USER_ID,
+    // Default to undefined - only pass user_id when explicitly set
+    // (client library v0.3.x doesn't pass user_id on GET, causing key mismatch)
+    userId: typeof cfg.userId === "string" ? cfg.userId : undefined,
+    workingMemorySessionId:
+      typeof cfg.workingMemorySessionId === "string" ? cfg.workingMemorySessionId : undefined,
     timeout:
       typeof cfg.timeout === "number" && Number.isFinite(cfg.timeout)
         ? cfg.timeout
@@ -238,6 +249,12 @@ export const memoryConfigSchema = {
       label: "User ID",
       placeholder: DEFAULT_USER_ID,
       help: "User ID for memory isolation (each user gets their own memories)",
+    },
+    workingMemorySessionId: {
+      label: "Working Memory Session ID",
+      placeholder: "my-session",
+      help: "Fixed session ID for working memory. If set, uses this instead of deriving from OpenClaw session. Useful for continuous memory across sessions.",
+      advanced: true,
     },
     timeout: {
       label: "Timeout (ms)",
