@@ -1,6 +1,6 @@
 {
   "name": "openclaw-redis-agent-memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenClaw plugin for long-term AI agent memory using Redis vector search",
   "type": "module",
   "main": "dist/index.js",
