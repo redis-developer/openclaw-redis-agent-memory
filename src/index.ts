@@ -387,20 +387,9 @@ const redisMemoryPlugin: PluginDefinition = {
 
           try {
             if (memoryId) {
-              // Direct fetch workaround for SDK issue
-              const deleteUrl = new URL("/v1/long-term-memory", cfg.serverUrl);
-              deleteUrl.searchParams.set("memory_ids", memoryId);
-              const deleteRes = await fetch(deleteUrl.toString(), {
-                method: "DELETE",
-                headers: {
-                  "Content-Type": "application/json",
-                  ...(cfg.apiKey && { "X-API-Key": cfg.apiKey }),
-                  ...(cfg.bearerToken && { Authorization: `Bearer ${cfg.bearerToken}` }),
-                },
+              await client.deleteLongTermMemories([memoryId], {
+                namespace: cfg.namespace,
               });
-              if (!deleteRes.ok) {
-                throw new Error(`Delete failed: ${deleteRes.status} ${deleteRes.statusText}`);
-              }
               return {
                 content: [{ type: "text", text: `Memory ${memoryId} forgotten.` }],
                 details: { action: "deleted", id: memoryId },
@@ -429,20 +418,9 @@ const redisMemoryPlugin: PluginDefinition = {
               }));
 
               if (scored.length === 1 && scored[0].score > 0.9) {
-                // Direct fetch workaround for SDK issue
-                const deleteUrl = new URL("/v1/long-term-memory", cfg.serverUrl);
-                deleteUrl.searchParams.set("memory_ids", scored[0].id);
-                const deleteRes = await fetch(deleteUrl.toString(), {
-                  method: "DELETE",
-                  headers: {
-                    "Content-Type": "application/json",
-                    ...(cfg.apiKey && { "X-API-Key": cfg.apiKey }),
-                    ...(cfg.bearerToken && { Authorization: `Bearer ${cfg.bearerToken}` }),
-                  },
+                await client.deleteLongTermMemories([scored[0].id], {
+                  namespace: cfg.namespace,
                 });
-                if (!deleteRes.ok) {
-                  throw new Error(`Delete failed: ${deleteRes.status} ${deleteRes.statusText}`);
-                }
                 return {
                   content: [{ type: "text", text: `Forgotten: "${scored[0].text}"` }],
                   details: { action: "deleted", id: scored[0].id },
