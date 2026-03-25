@@ -73,6 +73,22 @@ export type ToolDefinition = {
   execute: (toolCallId: string, params: unknown) => Promise<ToolResult>;
 };
 
+export type ToolFactoryContext = {
+  config?: unknown;
+  workspaceDir?: string;
+  agentDir?: string;
+  agentId?: string;
+  sessionKey?: string;
+  sessionId?: string;
+  messageChannel?: string;
+  agentAccountId?: string;
+  requesterSenderId?: string;
+  senderIsOwner?: boolean;
+  sandboxed?: boolean;
+};
+
+export type ToolFactory = (ctx: ToolFactoryContext) => ToolDefinition | ToolDefinition[] | null | undefined;
+
 /**
  * Hook event for before_agent_start.
  */
@@ -92,7 +108,13 @@ export type AgentEndEvent = {
  * Hook context.
  */
 export type HookContext = {
+  agentId?: string;
   sessionKey?: string;
+  sessionId?: string;
+  workspaceDir?: string;
+  messageProvider?: string;
+  trigger?: string;
+  channelId?: string;
 };
 
 /**
@@ -155,7 +177,7 @@ export type PluginApi = {
       };
     };
   };
-  registerTool: (tool: ToolDefinition, opts?: { name?: string }) => void;
+  registerTool: (tool: ToolDefinition | ToolFactory, opts?: { name?: string; names?: string[]; optional?: boolean }) => void;
   registerCli?: (fn: CliRegistration, opts?: { commands?: string[] }) => void;
   registerService: (service: ServiceDefinition) => void;
   on: <E>(event: string, handler: HookHandler<E>) => void;
@@ -178,4 +200,3 @@ export type PluginDefinition = {
   configSchema: unknown;
   register: (api: PluginApi) => void;
 };
-

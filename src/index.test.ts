@@ -12,8 +12,11 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { convertToMemoryMessages, readSessionIdFromStore } from "./index.js";
+import { resolveAgentScopePlan, parseAgentIdFromSessionKey } from "./scopes.js";
 
 const MEMORY_SERVER_URL = process.env.AGENT_MEMORY_SERVER_URL ?? "http://localhost:8000";
+const MEMORY_SERVER_API_KEY = process.env.AGENT_MEMORY_API_KEY;
+const MEMORY_SERVER_BEARER_TOKEN = process.env.AGENT_MEMORY_BEARER_TOKEN;
 const HAS_SERVER = Boolean(process.env.AGENT_MEMORY_SERVER_URL);
 const liveEnabled = HAS_SERVER && process.env.OPENCLAW_LIVE_TEST === "1";
 const describeLive = liveEnabled ? describe : describe.skip;
@@ -22,7 +25,7 @@ describe("redis-memory plugin", () => {
   test("memory plugin registers and initializes correctly", async () => {
     const { default: memoryPlugin } = await import("./index.js");
 
-    expect(memoryPlugin.id).toBe("redis-memory");
+    expect(memoryPlugin.id).toBe("openclaw-redis-agent-memory");
     expect(memoryPlugin.name).toBe("Redis Memory");
     expect(memoryPlugin.kind).toBe("memory");
     expect(memoryPlugin.configSchema).toBeDefined();
@@ -84,6 +87,64 @@ describe("redis-memory plugin", () => {
 
     expect(config?.summaryViewName).toBe("custom_summary");
     expect(config?.summaryTimeWindowDays).toBe(7);
+  });
+
+  test("config schema parses named scopes and agent routes", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+
+    const config = memoryPlugin.configSchema?.parse?.({
+      serverUrl: "http://localhost:8000",
+      namespace: "multi-agent-demo",
+      scopes: {
+        aditi_personal: {
+          userId: "aditi",
+        },
+        household: {
+          userId: "household",
+          summaryViewName: "household_summary",
+        },
+      },
+      agentScopes: {
+        main: {
+          primaryScope: "aditi_personal",
+          recallScopes: ["aditi_personal", "household"],
+          toolScopes: ["aditi_personal", "household"],
+          defaultStoreScope: "aditi_personal",
+        },
+        grocery: {
+          primaryScope: "household",
+        },
+      },
+    });
+
+    expect(config?.scopes?.aditi_personal?.namespace).toBe("multi-agent-demo");
+    expect(config?.scopes?.aditi_personal?.summaryViewName).toBe(
+      "agent_user_summary_aditi_personal",
+    );
+    expect(config?.scopes?.household?.summaryViewName).toBe("household_summary");
+    expect(config?.agentScopes?.main?.recallScopes).toEqual([
+      "aditi_personal",
+      "household",
+    ]);
+  });
+
+  test("config schema rejects agent routes that reference unknown scopes", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+
+    expect(() =>
+      memoryPlugin.configSchema?.parse?.({
+        scopes: {
+          personal: {
+            userId: "aditi",
+          },
+        },
+        agentScopes: {
+          main: {
+            primaryScope: "missing",
+          },
+        },
+      }),
+    ).toThrow(/unknown scope "missing"/i);
   });
 
   test("shouldCapture filters correctly", async () => {
@@ -259,6 +320,114 @@ describe("readSessionIdFromStore", () => {
   });
 });
 
+describe("agent scope routing", () => {
+  test("parses agent id from canonical session key", () => {
+    expect(parseAgentIdFromSessionKey("agent:travel:main")).toBe("travel");
+    expect(parseAgentIdFromSessionKey("main")).toBeNull();
+  });
+
+  test("resolves shared and isolated scopes per agent", () => {
+    const plan = resolveAgentScopePlan(
+      {
+        serverUrl: "http://localhost:8000",
+        namespace: "multi-agent-demo",
+        summaryViewName: "agent_user_summary",
+        summaryTimeWindowDays: 30,
+        summaryGroupBy: ["user_id"],
+        recallDescription: "recall",
+        storeDescription: "store",
+        forgetDescription: "forget",
+        scopes: {
+          aditi_personal: {
+            namespace: "multi-agent-demo",
+            userId: "aditi",
+            summaryViewName: "summary_aditi_personal",
+            summaryTimeWindowDays: 30,
+            summaryGroupBy: ["user_id"],
+          },
+          household: {
+            namespace: "multi-agent-demo",
+            userId: "household",
+            summaryViewName: "summary_household",
+            summaryTimeWindowDays: 30,
+            summaryGroupBy: ["user_id"],
+          },
+          partner_personal: {
+            namespace: "multi-agent-demo",
+            userId: "partner",
+            summaryViewName: "summary_partner_personal",
+            summaryTimeWindowDays: 30,
+            summaryGroupBy: ["user_id"],
+          },
+        },
+        agentScopes: {
+          main: {
+            primaryScope: "aditi_personal",
+            recallScopes: ["aditi_personal", "household"],
+            toolScopes: ["aditi_personal", "household"],
+          },
+          partner: {
+            primaryScope: "partner_personal",
+            recallScopes: ["partner_personal", "household"],
+            toolScopes: ["partner_personal", "household"],
+          },
+          grocery: {
+            primaryScope: "household",
+          },
+          travel: {
+            primaryScope: "aditi_personal",
+          },
+        },
+      },
+      { agentId: "main" },
+    );
+
+    expect(plan.primaryScope.key).toBe("aditi_personal");
+    expect(plan.recallScopes.map((scope) => scope.key)).toEqual([
+      "aditi_personal",
+      "household",
+    ]);
+
+    const groceryPlan = resolveAgentScopePlan(
+      {
+        serverUrl: "http://localhost:8000",
+        namespace: "multi-agent-demo",
+        summaryViewName: "agent_user_summary",
+        summaryTimeWindowDays: 30,
+        summaryGroupBy: ["user_id"],
+        recallDescription: "recall",
+        storeDescription: "store",
+        forgetDescription: "forget",
+        scopes: {
+          aditi_personal: {
+            namespace: "multi-agent-demo",
+            userId: "aditi",
+            summaryViewName: "summary_aditi_personal",
+            summaryTimeWindowDays: 30,
+            summaryGroupBy: ["user_id"],
+          },
+          household: {
+            namespace: "multi-agent-demo",
+            userId: "household",
+            summaryViewName: "summary_household",
+            summaryTimeWindowDays: 30,
+            summaryGroupBy: ["user_id"],
+          },
+        },
+        agentScopes: {
+          grocery: {
+            primaryScope: "household",
+          },
+        },
+      },
+      { sessionKey: "agent:grocery:main" },
+    );
+
+    expect(groceryPlan.primaryScope.key).toBe("household");
+    expect(groceryPlan.recallScopes.map((scope) => scope.key)).toEqual(["household"]);
+  });
+});
+
 describe("timestamp-based message filtering", () => {
   test("filters messages newer than cutoff timestamp", () => {
     const cutoffTs = 1706900000000;
@@ -318,7 +487,6 @@ describeLive("redis-memory plugin live tests", () => {
 
     // Mock plugin API
     const registeredTools: any[] = [];
-    const registeredClis: any[] = [];
     const registeredServices: any[] = [];
     const registeredHooks: Record<string, any[]> = {};
     const logs: string[] = [];
@@ -330,6 +498,8 @@ describeLive("redis-memory plugin live tests", () => {
       config: {},
       pluginConfig: {
         serverUrl: MEMORY_SERVER_URL,
+        ...(MEMORY_SERVER_API_KEY ? { apiKey: MEMORY_SERVER_API_KEY } : {}),
+        ...(MEMORY_SERVER_BEARER_TOKEN ? { bearerToken: MEMORY_SERVER_BEARER_TOKEN } : {}),
         namespace: testNamespace,
         autoCapture: false,
         autoRecall: false,
@@ -343,9 +513,6 @@ describeLive("redis-memory plugin live tests", () => {
       },
       registerTool: (tool: any, opts: any) => {
         registeredTools.push({ tool, opts });
-      },
-      registerCli: (registrar: any, opts: any) => {
-        registeredClis.push({ registrar, opts });
       },
       registerService: (service: any) => {
         registeredServices.push(service);
@@ -365,13 +532,17 @@ describeLive("redis-memory plugin live tests", () => {
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_recall");
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_store");
     expect(registeredTools.map((t) => t.opts?.name)).toContain("memory_forget");
-    expect(registeredClis.length).toBe(1);
     expect(registeredServices.length).toBe(1);
 
+    const buildTool = (name: string, ctx: Record<string, unknown> = {}) => {
+      const entry = registeredTools.find((t) => t.opts?.name === name)?.tool;
+      return typeof entry === "function" ? entry(ctx) : entry;
+    };
+
     // Get tool functions
-    const storeTool = registeredTools.find((t) => t.opts?.name === "memory_store")?.tool;
-    const recallTool = registeredTools.find((t) => t.opts?.name === "memory_recall")?.tool;
-    const forgetTool = registeredTools.find((t) => t.opts?.name === "memory_forget")?.tool;
+    const storeTool = buildTool("memory_store", { agentId: "main", sessionKey: "agent:main:main" });
+    const recallTool = buildTool("memory_recall", { agentId: "main", sessionKey: "agent:main:main" });
+    const forgetTool = buildTool("memory_forget", { agentId: "main", sessionKey: "agent:main:main" });
 
     // Use unique text per test run to avoid conflicts with previous runs
     const uniqueId = randomUUID().slice(0, 8);
@@ -443,6 +614,8 @@ describeLive("redis-memory plugin live tests", () => {
       config: {},
       pluginConfig: {
         serverUrl: MEMORY_SERVER_URL,
+        ...(MEMORY_SERVER_API_KEY ? { apiKey: MEMORY_SERVER_API_KEY } : {}),
+        ...(MEMORY_SERVER_BEARER_TOKEN ? { bearerToken: MEMORY_SERVER_BEARER_TOKEN } : {}),
       },
       runtime: {},
       logger: {
@@ -487,6 +660,8 @@ describeLive("redis-memory plugin live tests", () => {
       config: {},
       pluginConfig: {
         serverUrl: MEMORY_SERVER_URL,
+        ...(MEMORY_SERVER_API_KEY ? { apiKey: MEMORY_SERVER_API_KEY } : {}),
+        ...(MEMORY_SERVER_BEARER_TOKEN ? { bearerToken: MEMORY_SERVER_BEARER_TOKEN } : {}),
         namespace: testNamespace,
         summaryViewName: testViewName,
         summaryTimeWindowDays: 7,
@@ -519,4 +694,3 @@ describeLive("redis-memory plugin live tests", () => {
     expect(summaryLog).toBeDefined();
   }, 30000);
 });
-

@@ -38,6 +38,13 @@ import * as os from "node:os";
 import { type MemoryConfig, memoryConfigSchema } from "./config.js";
 import type { PluginApi, PluginDefinition } from "./types.js";
 import { stringEnum } from "./types.js";
+import {
+  getConfiguredScopes,
+  resolveAgentScopePlan,
+  type AgentScopePlan,
+  type ScopedMemoryTarget,
+  type AgentScopeContext,
+} from "./scopes.js";
 
 // ============================================================================
 // Session Store Helpers
@@ -88,6 +95,8 @@ type MemorySearchResult = {
   category?: string;
   topics?: string[];
   entities?: string[];
+  scope?: string;
+  scopeLabel?: string;
 };
 
 // ============================================================================
@@ -199,7 +208,7 @@ function detectCategory(text: string): MemoryCategory {
 // ============================================================================
 
 const redisMemoryPlugin: PluginDefinition = {
-  id: "redis-memory",
+  id: "openclaw-redis-agent-memory",
   name: "Redis Memory",
   description: "Redis-backed long-term memory via agent-memory-server with auto-recall/capture",
   kind: "memory",
@@ -220,282 +229,69 @@ const redisMemoryPlugin: PluginDefinition = {
     );
 
     // ========================================================================
-    // Tools
+    // Scope helpers
     // ========================================================================
 
-    api.registerTool(
-      {
-        name: "memory_recall",
-        label: "Memory Recall",
-        description: cfg.recallDescription!,
-        parameters: Type.Object({
-          query: Type.String({ description: "Search query" }),
-          limit: Type.Optional(Type.Number({ description: "Max results (default: 5)" })),
-        }),
-        async execute(_toolCallId, params) {
-          const { query, limit = 5 } = params as { query: string; limit?: number };
+    const summaryViewIds = new Map<string, string | null>();
 
-          try {
-            const results = await client.searchLongTermMemory({
-              text: query,
-              limit,
-              namespace: cfg.namespace ? { eq: cfg.namespace } : undefined,
-              userId: cfg.userId ? { eq: cfg.userId } : undefined,
-            });
-
-            if (results.memories.length === 0) {
-              return {
-                content: [{ type: "text", text: "No relevant memories found." }],
-                details: { count: 0 },
-              };
-            }
-
-            // Convert distance to similarity score (lower distance = higher similarity)
-            const mapped: MemorySearchResult[] = results.memories.map((m) => ({
-              id: m.id,
-              text: m.text,
-              score: Math.max(0, 1 - (m.dist ?? 0)),
-              topics: m.topics ?? undefined,
-              entities: m.entities ?? undefined,
-            }));
-
-            // Filter by minimum score
-            const filtered = mapped.filter((r) => r.score >= cfg.minScore!);
-
-            if (filtered.length === 0) {
-              return {
-                content: [{ type: "text", text: "No relevant memories found." }],
-                details: { count: 0 },
-              };
-            }
-
-            const text = filtered
-              .map((r, i) => `${i + 1}. ${r.text} (${(r.score * 100).toFixed(0)}%)`)
-              .join("\n");
-
-            return {
-              content: [
-                { type: "text", text: `Found ${filtered.length} memories:\n\n${text}` },
-              ],
-              details: { count: filtered.length, memories: filtered },
-            };
-          } catch (err) {
-            api.logger.warn(`redis-memory: recall failed: ${String(err)}`);
-            return {
-              content: [{ type: "text", text: `Memory search failed: ${String(err)}` }],
-              details: { error: String(err) },
-            };
-          }
-        },
-      },
-      { name: "memory_recall" },
-    );
-
-    api.registerTool(
-      {
-        name: "memory_store",
-        label: "Memory Store",
-        description: cfg.storeDescription!,
-        parameters: Type.Object({
-          text: Type.String({ description: "Information to remember" }),
-          category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
-        }),
-        async execute(_toolCallId, params) {
-          const { text, category = "other" } = params as {
-            text: string;
-            category?: MemoryCategory;
-          };
-
-          // Validate text is non-empty
-          if (!text || !text.trim()) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Error: The 'text' parameter is required and cannot be empty. Please provide the actual content you want to store in memory.",
-                },
-              ],
-              details: { error: "empty_text", action: "rejected" },
-            };
-          }
-
-          try {
-            // Check for duplicates by searching first
-            const existing = await client.searchLongTermMemory({
-              text,
-              limit: 1,
-              namespace: cfg.namespace ? { eq: cfg.namespace } : undefined,
-              userId: cfg.userId ? { eq: cfg.userId } : undefined,
-            });
-
-            if (existing.memories.length > 0 && existing.memories[0].dist < 0.05) {
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Similar memory already exists: "${existing.memories[0].text}"`,
-                  },
-                ],
-                details: {
-                  action: "duplicate",
-                  existingId: existing.memories[0].id,
-                  existingText: existing.memories[0].text,
-                },
-              };
-            }
-
-            const memoryId = randomUUID();
-            await client.createLongTermMemory(
-              [
-                {
-                  id: memoryId,
-                  text,
-                  topics: [category],
-                  namespace: cfg.namespace,
-                },
-              ],
-              { namespace: cfg.namespace },
-            );
-
-            return {
-              content: [{ type: "text", text: `Stored: "${text.slice(0, 100)}..."` }],
-              details: { action: "created", id: memoryId },
-            };
-          } catch (err) {
-            api.logger.warn(`redis-memory: store failed: ${String(err)}`);
-            return {
-              content: [{ type: "text", text: `Memory store failed: ${String(err)}` }],
-              details: { error: String(err) },
-            };
-          }
-        },
-      },
-      { name: "memory_store" },
-    );
-
-    api.registerTool(
-      {
-        name: "memory_forget",
-        label: "Memory Forget",
-        description: cfg.forgetDescription!,
-        parameters: Type.Object({
-          query: Type.Optional(Type.String({ description: "Search to find memory" })),
-          memoryId: Type.Optional(Type.String({ description: "Specific memory ID" })),
-        }),
-        async execute(_toolCallId, params) {
-          const { query, memoryId } = params as { query?: string; memoryId?: string };
-
-          try {
-            if (memoryId) {
-              await client.deleteLongTermMemories([memoryId], {
-                namespace: cfg.namespace,
-              });
-              return {
-                content: [{ type: "text", text: `Memory ${memoryId} forgotten.` }],
-                details: { action: "deleted", id: memoryId },
-              };
-            }
-
-            if (query) {
-              const results = await client.searchLongTermMemory({
-                text: query,
-                limit: 5,
-                namespace: cfg.namespace ? { eq: cfg.namespace } : undefined,
-                userId: cfg.userId ? { eq: cfg.userId } : undefined,
-              });
-
-              if (results.memories.length === 0) {
-                return {
-                  content: [{ type: "text", text: "No matching memories found." }],
-                  details: { found: 0 },
-                };
-              }
-
-              // Convert distance to similarity score
-              const scored = results.memories.map((m) => ({
-                ...m,
-                score: Math.max(0, 1 - (m.dist ?? 0)),
-              }));
-
-              if (scored.length === 1 && scored[0].score > 0.9) {
-                await client.deleteLongTermMemories([scored[0].id], {
-                  namespace: cfg.namespace,
-                });
-                return {
-                  content: [{ type: "text", text: `Forgotten: "${scored[0].text}"` }],
-                  details: { action: "deleted", id: scored[0].id },
-                };
-              }
-
-              const list = scored
-                .map((r) => `- [${r.id.slice(0, 8)}] ${r.text.slice(0, 60)}...`)
-                .join("\n");
-
-              const candidates = scored.map((r) => ({
-                id: r.id,
-                text: r.text,
-                score: r.score,
-              }));
-
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `Found ${scored.length} candidates. Specify memoryId:\n${list}`,
-                  },
-                ],
-                details: { action: "candidates", candidates },
-              };
-            }
-
-            return {
-              content: [{ type: "text", text: "Provide query or memoryId." }],
-              details: { error: "missing_param" },
-            };
-          } catch (err) {
-            api.logger.warn(`redis-memory: forget failed: ${String(err)}`);
-            return {
-              content: [{ type: "text", text: `Memory forget failed: ${String(err)}` }],
-              details: { error: String(err) },
-            };
-          }
-        },
-      },
-      { name: "memory_forget" },
-    );
-
-    // ========================================================================
-    // Summary View Management
-    // ========================================================================
-
-    let summaryViewId: string | null = null;
-
-    // Track max message timestamp per session to avoid re-sending messages
+    // Track max message timestamp per session/scope pair to avoid re-sending messages
     const sessionMaxTimestamps = new Map<string, number>();
 
-    async function ensureSummaryView(): Promise<string | null> {
+    function buildTrackingKey(scope: ScopedMemoryTarget, workingMemorySessionId: string): string {
+      return `${scope.key}::${workingMemorySessionId}`;
+    }
+
+    function getWorkingMemorySessionId(
+      sessionKey: string,
+      scope: ScopedMemoryTarget,
+    ): string {
+      if (scope.workingMemorySessionId) {
+        return scope.workingMemorySessionId;
+      }
+
+      const sessionId = readSessionIdFromStore(sessionKey);
+      if (sessionId) {
+        return `${sessionKey}:${sessionId}`;
+      }
+
+      return sessionKey;
+    }
+
+    function getToolPlan(ctx?: AgentScopeContext): AgentScopePlan {
+      return resolveAgentScopePlan(cfg, ctx);
+    }
+
+    function describeScopes(scopes: ScopedMemoryTarget[], defaultScope?: ScopedMemoryTarget): string {
+      if (scopes.length <= 1) return "";
+      const scopeList = scopes.map((scope) => `${scope.key} (${scope.label})`).join(", ");
+      const defaultText = defaultScope ? ` Default scope is "${defaultScope.key}".` : "";
+      return ` Available scopes: ${scopeList}.${defaultText}`;
+    }
+
+    async function ensureSummaryView(scope: ScopedMemoryTarget): Promise<string | null> {
       try {
         const views = await client.listSummaryViews();
-        const existing = views.find((v) => v.name === cfg.summaryViewName);
+        const existing = views.find((view) => view.name === scope.summaryViewName);
 
         if (existing) {
           api.logger.info?.(
-            `redis-memory: using existing summary view "${cfg.summaryViewName}" (id: ${existing.id})`,
+            `redis-memory: using existing summary view "${scope.summaryViewName}" for scope "${scope.key}" (id: ${existing.id})`,
           );
+          summaryViewIds.set(scope.key, existing.id);
           return existing.id;
         }
 
         const filters: Record<string, unknown> = {};
-        if (cfg.namespace) {
-          filters.namespace = cfg.namespace;
+        if (scope.namespace) {
+          filters.namespace = scope.namespace;
         }
 
         const newView = await client.createSummaryView({
-          name: cfg.summaryViewName,
+          name: scope.summaryViewName,
           source: "long_term",
-          group_by: cfg.summaryGroupBy ?? ["user_id"],
+          group_by: scope.summaryGroupBy,
           filters: Object.keys(filters).length > 0 ? filters : undefined,
-          time_window_days: cfg.summaryTimeWindowDays,
+          time_window_days: scope.summaryTimeWindowDays,
           continuous: false,
           prompt:
             "Summarize key facts, preferences, decisions, and important context about the user. " +
@@ -504,154 +300,557 @@ const redisMemoryPlugin: PluginDefinition = {
         });
 
         api.logger.info?.(
-          `redis-memory: created summary view "${cfg.summaryViewName}" (id: ${newView.id})`,
+          `redis-memory: created summary view "${scope.summaryViewName}" for scope "${scope.key}" (id: ${newView.id})`,
         );
+        summaryViewIds.set(scope.key, newView.id);
         return newView.id;
       } catch (err) {
-        api.logger.warn(`redis-memory: failed to initialize summary view: ${String(err)}`);
+        api.logger.warn(
+          `redis-memory: failed to initialize summary view for scope "${scope.key}": ${String(err)}`,
+        );
+        summaryViewIds.set(scope.key, null);
         return null;
       }
     }
 
-    // ========================================================================
-    // Session Tracking
-    // ========================================================================
+    async function searchScope(
+      scope: ScopedMemoryTarget,
+      query: string,
+      limit: number,
+    ): Promise<MemorySearchResult[]> {
+      const distanceThreshold = cfg.minScore !== undefined ? 1 - cfg.minScore : undefined;
+      const results = await client.searchLongTermMemory({
+        text: query,
+        limit,
+        namespace: scope.namespace ? { eq: scope.namespace } : undefined,
+        userId: scope.userId ? { eq: scope.userId } : undefined,
+        distanceThreshold,
+      });
 
-    /**
-     * Get the working memory session ID.
-     *
-     * Priority:
-     * 1. Config override (workingMemorySessionId) - for fixed continuous sessions
-     * 2. Try to read sessionId from OpenClaw session store -> sessionKey:sessionId
-     * 3. Fall back to sessionKey only -> continuous session across resets
-     *
-     * When we can't get the sessionId, we use sessionKey only, which means
-     * the working memory is continuous across session resets. The server
-     * will auto-compact/summarize over time.
-     */
-    function getWorkingMemorySessionId(sessionKey: string): string {
-      // 1. Config override takes priority
-      if (cfg.workingMemorySessionId) {
-        return cfg.workingMemorySessionId;
-      }
-
-      // 2. Try to read sessionId from OpenClaw session store
-      const sessionId = readSessionIdFromStore(sessionKey);
-      if (sessionId) {
-        return `${sessionKey}:${sessionId}`;
-      }
-
-      // 3. Fall back to sessionKey only (continuous session)
-      return sessionKey;
+      return results.memories
+        .map((memory) => ({
+          id: memory.id,
+          text: memory.text,
+          score: Math.max(0, 1 - (memory.dist ?? 0)),
+          topics: memory.topics ?? undefined,
+          entities: memory.entities ?? undefined,
+          scope: scope.key,
+          scopeLabel: scope.label,
+        }))
+        .filter((memory) => memory.score >= (cfg.minScore ?? 0.3));
     }
+
+    function resolveSelectedScope(
+      scopeKey: string | undefined,
+      allowedScopes: ScopedMemoryTarget[],
+      fallbackScope: ScopedMemoryTarget,
+    ): ScopedMemoryTarget {
+      if (!scopeKey) return fallbackScope;
+
+      const scope = allowedScopes.find((candidate) => candidate.key === scopeKey);
+      if (!scope) {
+        throw new Error(`Scope "${scopeKey}" is not available for this agent`);
+      }
+      return scope;
+    }
+
+    function buildLongTermMemoryStrategy(scope: ScopedMemoryTarget) {
+      if (!scope.extractionStrategy) return undefined;
+      return {
+        strategy: scope.extractionStrategy,
+        config:
+          scope.extractionStrategy === "custom" && scope.customPrompt
+            ? { prompt: scope.customPrompt }
+            : {},
+      };
+    }
+
+    async function refreshSummaryView(scope: ScopedMemoryTarget) {
+      const viewId = summaryViewIds.get(scope.key);
+      if (!viewId) return;
+
+      try {
+        const task = await client.runSummaryView(viewId);
+        api.logger.debug?.(
+          `redis-memory: triggered summary refresh for scope "${scope.key}" (task: ${task.id})`,
+        );
+      } catch (refreshErr) {
+        if (refreshErr instanceof MemoryNotFoundError) {
+          api.logger.info?.(
+            `redis-memory: summary view missing for scope "${scope.key}", re-creating...`,
+          );
+          await ensureSummaryView(scope);
+        } else {
+          api.logger.debug?.(
+            `redis-memory: summary refresh trigger failed for scope "${scope.key}": ${String(refreshErr)}`,
+          );
+        }
+      }
+    }
+
+    // ========================================================================
+    // Tools
+    // ========================================================================
+
+    api.registerTool(
+      (toolCtx) => {
+        const plan = getToolPlan({
+          agentId: toolCtx.agentId,
+          sessionKey: toolCtx.sessionKey,
+        });
+        const scopeKeys = plan.recallScopes.map((scope) => scope.key);
+        const parameters: Record<string, unknown> = {
+          query: Type.String({ description: "Search query" }),
+          limit: Type.Optional(Type.Number({ description: "Max results (default: 5)" })),
+        };
+        if (scopeKeys.length > 1) {
+          parameters.scope = Type.Optional(
+            stringEnum(scopeKeys, {
+              description: "Optional memory boundary to search within",
+            }),
+          );
+        }
+
+        return {
+          name: "memory_recall",
+          label: "Memory Recall",
+          description:
+            cfg.recallDescription! +
+            describeScopes(plan.recallScopes, plan.defaultStoreScope),
+          parameters: Type.Object(parameters as Record<string, any>),
+          async execute(_toolCallId, params) {
+            const { query, limit = 5, scope: scopeKey } = params as {
+              query: string;
+              limit?: number;
+              scope?: string;
+            };
+
+            try {
+              const targetScopes = scopeKey
+                ? [resolveSelectedScope(scopeKey, plan.recallScopes, plan.defaultStoreScope)]
+                : plan.recallScopes;
+
+              const scopedResults = await Promise.all(
+                targetScopes.map(async (scope) => ({
+                  scope,
+                  memories: await searchScope(scope, query, limit),
+                })),
+              );
+
+              const merged = scopedResults
+                .flatMap((entry) => entry.memories)
+                .sort((left, right) => right.score - left.score)
+                .slice(0, limit);
+
+              if (merged.length === 0) {
+                return {
+                  content: [{ type: "text", text: "No relevant memories found." }],
+                  details: { count: 0 },
+                };
+              }
+
+              const text = merged
+                .map((memory, index) => {
+                  const prefix =
+                    targetScopes.length > 1
+                      ? `[${memory.scopeLabel ?? memory.scope}] `
+                      : "";
+                  return `${index + 1}. ${prefix}${memory.text} (${(memory.score * 100).toFixed(0)}%)`;
+                })
+                .join("\n");
+
+              return {
+                content: [{ type: "text", text: `Found ${merged.length} memories:\n\n${text}` }],
+                details: { count: merged.length, memories: merged },
+              };
+            } catch (err) {
+              api.logger.warn(`redis-memory: recall failed: ${String(err)}`);
+              return {
+                content: [{ type: "text", text: `Memory search failed: ${String(err)}` }],
+                details: { error: String(err) },
+              };
+            }
+          },
+        };
+      },
+      { name: "memory_recall" },
+    );
+
+    api.registerTool(
+      (toolCtx) => {
+        const plan = getToolPlan({
+          agentId: toolCtx.agentId,
+          sessionKey: toolCtx.sessionKey,
+        });
+        const scopeKeys = plan.toolScopes.map((scope) => scope.key);
+        const parameters: Record<string, unknown> = {
+          text: Type.String({ description: "Information to remember" }),
+          category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
+        };
+        if (scopeKeys.length > 1) {
+          parameters.scope = Type.Optional(
+            stringEnum(scopeKeys, {
+              description: "Optional memory boundary to store within",
+            }),
+          );
+        }
+
+        return {
+          name: "memory_store",
+          label: "Memory Store",
+          description:
+            cfg.storeDescription! +
+            describeScopes(plan.toolScopes, plan.defaultStoreScope),
+          parameters: Type.Object(parameters as Record<string, any>),
+          async execute(_toolCallId, params) {
+            const { text, category, scope: scopeKey } = params as {
+              text: string;
+              category?: MemoryCategory;
+              scope?: string;
+            };
+
+            if (!text || !text.trim()) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: "Error: The 'text' parameter is required and cannot be empty. Please provide the actual content you want to store in memory.",
+                  },
+                ],
+                details: { error: "empty_text", action: "rejected" },
+              };
+            }
+
+            try {
+              const targetScope = resolveSelectedScope(
+                scopeKey,
+                plan.toolScopes,
+                plan.defaultStoreScope,
+              );
+              const inferredCategory = category ?? detectCategory(text);
+              const existing = await client.searchLongTermMemory({
+                text,
+                limit: 1,
+                namespace: targetScope.namespace ? { eq: targetScope.namespace } : undefined,
+                userId: targetScope.userId ? { eq: targetScope.userId } : undefined,
+              });
+
+              if (existing.memories.length > 0 && existing.memories[0].dist < 0.05) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text:
+                        `Similar memory already exists in ${targetScope.label}: ` +
+                        `"${existing.memories[0].text}"`,
+                    },
+                  ],
+                  details: {
+                    action: "duplicate",
+                    scope: targetScope.key,
+                    existingId: existing.memories[0].id,
+                    existingText: existing.memories[0].text,
+                  },
+                };
+              }
+
+              const memoryId = randomUUID();
+              await client.createLongTermMemory(
+                [
+                  {
+                    id: memoryId,
+                    text,
+                    topics: [inferredCategory],
+                    namespace: targetScope.namespace,
+                    ...(targetScope.userId ? { user_id: targetScope.userId } : {}),
+                  },
+                ],
+                { namespace: targetScope.namespace },
+              );
+
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Stored in ${targetScope.label}: "${text.slice(0, 100)}..."`,
+                  },
+                ],
+                details: { action: "created", id: memoryId, scope: targetScope.key },
+              };
+            } catch (err) {
+              api.logger.warn(`redis-memory: store failed: ${String(err)}`);
+              return {
+                content: [{ type: "text", text: `Memory store failed: ${String(err)}` }],
+                details: { error: String(err) },
+              };
+            }
+          },
+        };
+      },
+      { name: "memory_store" },
+    );
+
+    api.registerTool(
+      (toolCtx) => {
+        const plan = getToolPlan({
+          agentId: toolCtx.agentId,
+          sessionKey: toolCtx.sessionKey,
+        });
+        const scopeKeys = plan.toolScopes.map((scope) => scope.key);
+        const parameters: Record<string, unknown> = {
+          query: Type.Optional(Type.String({ description: "Search to find memory" })),
+          memoryId: Type.Optional(Type.String({ description: "Specific memory ID" })),
+        };
+        if (scopeKeys.length > 1) {
+          parameters.scope = Type.Optional(
+            stringEnum(scopeKeys, {
+              description: "Optional memory boundary to delete from",
+            }),
+          );
+        }
+
+        return {
+          name: "memory_forget",
+          label: "Memory Forget",
+          description:
+            cfg.forgetDescription! +
+            describeScopes(plan.toolScopes, plan.defaultStoreScope),
+          parameters: Type.Object(parameters as Record<string, any>),
+          async execute(_toolCallId, params) {
+            const { query, memoryId, scope: scopeKey } = params as {
+              query?: string;
+              memoryId?: string;
+              scope?: string;
+            };
+
+            try {
+              const targetScopes = scopeKey
+                ? [resolveSelectedScope(scopeKey, plan.toolScopes, plan.defaultStoreScope)]
+                : plan.toolScopes;
+
+              if (memoryId) {
+                let lastError: unknown;
+                for (const scope of targetScopes) {
+                  try {
+                    await client.deleteLongTermMemories([memoryId], {
+                      namespace: scope.namespace,
+                    });
+                    return {
+                      content: [
+                        {
+                          type: "text",
+                          text: `Memory ${memoryId} forgotten from ${scope.label}.`,
+                        },
+                      ],
+                      details: { action: "deleted", id: memoryId, scope: scope.key },
+                    };
+                  } catch (err) {
+                    lastError = err;
+                  }
+                }
+
+                throw lastError ?? new Error(`Memory ${memoryId} not found`);
+              }
+
+              if (query) {
+                const merged = (
+                  await Promise.all(
+                    targetScopes.map((scope) => searchScope(scope, query, 5)),
+                  )
+                )
+                  .flat()
+                  .sort((left, right) => right.score - left.score);
+
+                if (merged.length === 0) {
+                  return {
+                    content: [{ type: "text", text: "No matching memories found." }],
+                    details: { found: 0 },
+                  };
+                }
+
+                if (merged.length === 1 && merged[0].score > 0.9) {
+                  const winningScope = targetScopes.find(
+                    (scope) => scope.key === merged[0].scope,
+                  ) ?? plan.defaultStoreScope;
+                  await client.deleteLongTermMemories([merged[0].id], {
+                    namespace: winningScope.namespace,
+                  });
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Forgotten from ${winningScope.label}: "${merged[0].text}"`,
+                      },
+                    ],
+                    details: {
+                      action: "deleted",
+                      id: merged[0].id,
+                      scope: winningScope.key,
+                    },
+                  };
+                }
+
+                const list = merged
+                  .map((result) => {
+                    const scopeLabel = result.scopeLabel ?? result.scope ?? "unknown";
+                    return `- [${result.id.slice(0, 8)}] [${scopeLabel}] ${result.text.slice(0, 60)}...`;
+                  })
+                  .join("\n");
+
+                const candidates = merged.map((result) => ({
+                  id: result.id,
+                  text: result.text,
+                  score: result.score,
+                  scope: result.scope,
+                  scopeLabel: result.scopeLabel,
+                }));
+
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: `Found ${merged.length} candidates. Specify memoryId${scopeKeys.length > 1 ? " and optional scope" : ""}:\n${list}`,
+                    },
+                  ],
+                  details: { action: "candidates", candidates },
+                };
+              }
+
+              return {
+                content: [{ type: "text", text: "Provide query or memoryId." }],
+                details: { error: "missing_param" },
+              };
+            } catch (err) {
+              api.logger.warn(`redis-memory: forget failed: ${String(err)}`);
+              return {
+                content: [{ type: "text", text: `Memory forget failed: ${String(err)}` }],
+                details: { error: String(err) },
+              };
+            }
+          },
+        };
+      },
+      { name: "memory_forget" },
+    );
 
     // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 
-    // Auto-recall: inject rolling summary + query-specific memories before agent starts
+    // Auto-recall: inject rolling summary + query-specific memories before prompt build
     if (cfg.autoRecall) {
-      api.on("before_agent_start", async (event, ctx) => {
+      api.on("before_prompt_build", async (event, ctx) => {
         const e = event as { prompt?: string };
         if (!e.prompt || e.prompt.length < 5) return;
 
         const sessionKey = ctx?.sessionKey ?? "default";
+        const plan = resolveAgentScopePlan(cfg, {
+          agentId: ctx?.agentId,
+          sessionKey,
+        });
 
-        // Get the working memory session ID (includes sessionId from session store)
-        // This also detects and handles session resets automatically
-        const sessionId = getWorkingMemorySessionId(sessionKey);
-        try {
-          const wm = await client.getWorkingMemory(sessionId, {
-            namespace: cfg.namespace,
-          });
-          if (wm && wm.messages && wm.messages.length > 0) {
-            const maxTs = Math.max(
-              ...wm.messages.map((m) =>
-                m.created_at ? new Date(m.created_at).getTime() : 0,
-              ),
-            );
-            sessionMaxTimestamps.set(sessionId, maxTs);
-          } else {
-            sessionMaxTimestamps.delete(sessionId);
+        for (const scope of plan.captureScopes) {
+          const workingMemorySessionId = getWorkingMemorySessionId(sessionKey, scope);
+          const trackingKey = buildTrackingKey(scope, workingMemorySessionId);
+          try {
+            const workingMemory = await client.getWorkingMemory(workingMemorySessionId, {
+              namespace: scope.namespace,
+            });
+            if (workingMemory?.messages && workingMemory.messages.length > 0) {
+              const maxTs = Math.max(
+                ...workingMemory.messages.map((message) =>
+                  message.created_at ? new Date(message.created_at).getTime() : 0,
+                ),
+              );
+              sessionMaxTimestamps.set(trackingKey, maxTs);
+            } else {
+              sessionMaxTimestamps.delete(trackingKey);
+            }
+          } catch {
+            sessionMaxTimestamps.delete(trackingKey);
           }
-        } catch (err) {
-          // New session or error - no existing messages
-          sessionMaxTimestamps.delete(sessionId);
         }
 
         const contextParts: string[] = [];
 
-        // 1. Try to get the cached summary from the summary view
-        if (summaryViewId) {
-          try {
-            const partitions = await client.listSummaryViewPartitions(summaryViewId, {
-              namespace: cfg.namespace,
-              userId: cfg.userId,
-            });
+        const searchQuery = stripEnvelopeForSearch(e.prompt);
+        for (const scope of plan.recallScopes) {
+          const scopedContextParts: string[] = [];
 
-            const partition = partitions.find((p) => {
-              const groupBy = cfg.summaryGroupBy ?? ["user_id"];
-              for (const field of groupBy) {
-                if (field === "user_id" && p.group.user_id !== cfg.userId) return false;
-                if (field === "namespace" && p.group.namespace !== cfg.namespace) return false;
+          const viewId = summaryViewIds.get(scope.key) ?? (await ensureSummaryView(scope));
+          if (viewId) {
+            try {
+              const partitions = await client.listSummaryViewPartitions(viewId, {
+                namespace: scope.namespace,
+                userId: scope.userId,
+              });
+
+              const partition =
+                partitions.find((partition) => {
+                  for (const field of scope.summaryGroupBy) {
+                    if (field === "user_id" && partition.group.user_id !== scope.userId) {
+                      return false;
+                    }
+                    if (
+                      field === "namespace" &&
+                      partition.group.namespace !== scope.namespace
+                    ) {
+                      return false;
+                    }
+                  }
+                  return true;
+                }) ?? partitions[0];
+
+              if (partition?.summary && partition.memory_count > 0) {
+                scopedContextParts.push(
+                  `<user-summary computed="${partition.computed_at ?? "unknown"}" memories="${partition.memory_count}">\n${partition.summary}\n</user-summary>`,
+                );
+                api.logger.info?.(
+                  `redis-memory: injecting summary for scope "${scope.key}" (${partition.memory_count} memories)`,
+                );
               }
-              return true;
-            }) ?? partitions[0];
-
-            if (partition && partition.summary && partition.memory_count > 0) {
-              contextParts.push(
-                `<user-summary computed="${partition.computed_at ?? "unknown"}" memories="${partition.memory_count}">\n${partition.summary}\n</user-summary>`,
-              );
-              api.logger.info?.(
-                `redis-memory: injecting summary (${partition.memory_count} memories)`,
-              );
-            }
-          } catch (err) {
-            if (err instanceof MemoryNotFoundError) {
-              api.logger.info?.("redis-memory: summary view not found, re-creating...");
-              summaryViewId = await ensureSummaryView();
-            } else {
-              api.logger.debug?.(`redis-memory: summary view fetch failed: ${String(err)}`);
+            } catch (err) {
+              if (err instanceof MemoryNotFoundError) {
+                api.logger.info?.(
+                  `redis-memory: summary view missing for scope "${scope.key}", re-creating...`,
+                );
+                await ensureSummaryView(scope);
+              } else {
+                api.logger.debug?.(
+                  `redis-memory: summary view fetch failed for scope "${scope.key}": ${String(err)}`,
+                );
+              }
             }
           }
-        }
 
-        // 2. Semantic search for query-specific memories
-        try {
-          const searchQuery = stripEnvelopeForSearch(e.prompt);
           if (searchQuery && searchQuery.length >= 5) {
-            const distanceThreshold = cfg.minScore !== undefined ? 1 - cfg.minScore : undefined;
-
-            const results = await client.searchLongTermMemory({
-              text: searchQuery,
-              limit: cfg.recallLimit,
-              namespace: cfg.namespace ? { eq: cfg.namespace } : undefined,
-              userId: cfg.userId ? { eq: cfg.userId } : undefined,
-              distanceThreshold,
-            });
-
-            if (results.memories.length > 0) {
-              const filtered = results.memories
-                .map((m) => ({
-                  id: m.id,
-                  text: m.text,
-                  score: Math.max(0, 1 - (m.dist ?? 0)),
-                }))
-                .filter((r) => r.score >= (cfg.minScore ?? 0.3));
-
+            try {
+              const filtered = await searchScope(scope, searchQuery, cfg.recallLimit ?? 3);
               if (filtered.length > 0) {
-                const memoryList = filtered.map((r) => `- ${r.text}`).join("\n");
-                contextParts.push(
+                const memoryList = filtered.map((memory) => `- ${memory.text}`).join("\n");
+                scopedContextParts.push(
                   `<relevant-memories query-specific="true">\n${memoryList}\n</relevant-memories>`,
                 );
                 api.logger.info?.(
-                  `redis-memory: injecting ${filtered.length} query-specific memories`,
+                  `redis-memory: injecting ${filtered.length} query-specific memories for scope "${scope.key}"`,
                 );
               }
+            } catch (err) {
+              api.logger.warn(
+                `redis-memory: semantic search failed for scope "${scope.key}": ${String(err)}`,
+              );
             }
           }
-        } catch (err) {
-          api.logger.warn(`redis-memory: semantic search failed: ${String(err)}`);
+
+          if (scopedContextParts.length === 0) continue;
+
+          if (plan.recallScopes.length > 1) {
+            contextParts.push(
+              `<memory-scope key="${scope.key}" label="${scope.label}">\n${scopedContextParts.join("\n\n")}\n</memory-scope>`,
+            );
+          } else {
+            contextParts.push(scopedContextParts.join("\n\n"));
+          }
         }
 
         if (contextParts.length === 0) return;
@@ -673,65 +872,39 @@ const redisMemoryPlugin: PluginDefinition = {
 
         try {
           const sessionKey = ctx?.sessionKey ?? `session-${Date.now()}`;
-
-          // Get the working memory session ID (includes sessionId from session store)
-          const workingMemorySessionId = getWorkingMemorySessionId(sessionKey);
+          const plan = resolveAgentScopePlan(cfg, {
+            agentId: ctx?.agentId,
+            sessionKey,
+          });
 
           const allMemoryMessages = convertToMemoryMessages(e.messages);
           if (allMemoryMessages.length === 0) {
             return;
           }
 
-          // Filter to only messages newer than what we had at turn start
-          // Note: use workingMemorySessionId for tracking since that's what we used in before_agent_start
-          const cutoffTs = sessionMaxTimestamps.get(workingMemorySessionId) ?? 0;
-          const newMessages = allMemoryMessages.filter((m) => {
-            const msgTs = m.created_at ? new Date(m.created_at).getTime() : 0;
-            return msgTs > cutoffTs;
-          });
+          for (const scope of plan.captureScopes) {
+            const workingMemorySessionId = getWorkingMemorySessionId(sessionKey, scope);
+            const trackingKey = buildTrackingKey(scope, workingMemorySessionId);
+            const cutoffTs = sessionMaxTimestamps.get(trackingKey) ?? 0;
+            const newMessages = allMemoryMessages.filter((message) => {
+              const messageTs = message.created_at ? new Date(message.created_at).getTime() : 0;
+              return messageTs > cutoffTs;
+            });
 
-          // Clean up tracking for this session
-          sessionMaxTimestamps.delete(workingMemorySessionId);
+            sessionMaxTimestamps.delete(trackingKey);
 
-          if (newMessages.length === 0) {
-            return;
-          }
-
-          const longTermMemoryStrategy = cfg.extractionStrategy
-            ? {
-                strategy: cfg.extractionStrategy,
-                config:
-                  cfg.extractionStrategy === "custom" && cfg.customPrompt
-                    ? { prompt: cfg.customPrompt }
-                    : {},
-              }
-            : undefined;
-
-          // Only include user_id if explicitly configured
-          await client.putWorkingMemory(workingMemorySessionId, {
-            messages: newMessages,
-            namespace: cfg.namespace,
-            ...(cfg.userId ? { user_id: cfg.userId } : {}),
-            long_term_memory_strategy: longTermMemoryStrategy,
-          });
-
-          // Trigger async summary view refresh (non-blocking)
-          if (summaryViewId) {
-            try {
-              const task = await client.runSummaryView(summaryViewId);
-              api.logger.debug?.(
-                `redis-memory: triggered summary refresh (task: ${task.id})`,
-              );
-            } catch (refreshErr) {
-              if (refreshErr instanceof MemoryNotFoundError) {
-                api.logger.info?.("redis-memory: summary view not found, re-creating...");
-                summaryViewId = await ensureSummaryView();
-              } else {
-                api.logger.debug?.(
-                  `redis-memory: summary refresh trigger failed: ${String(refreshErr)}`,
-                );
-              }
+            if (newMessages.length === 0) {
+              continue;
             }
+
+            await client.putWorkingMemory(workingMemorySessionId, {
+              messages: newMessages,
+              namespace: scope.namespace,
+              ...(scope.userId ? { user_id: scope.userId } : {}),
+              long_term_memory_strategy: buildLongTermMemoryStrategy(scope),
+            });
+
+            await refreshSummaryView(scope);
           }
         } catch (err) {
           api.logger.warn(`redis-memory: capture failed: ${String(err)}`);
@@ -752,8 +925,9 @@ const redisMemoryPlugin: PluginDefinition = {
             `redis-memory: connected to server (${cfg.serverUrl}, namespace: ${cfg.namespace ?? "default"})`,
           );
 
-          // Initialize summary view
-          summaryViewId = await ensureSummaryView();
+          for (const scope of getConfiguredScopes(cfg)) {
+            await ensureSummaryView(scope);
+          }
         } catch (err) {
           api.logger.warn(
             `redis-memory: server not reachable at ${cfg.serverUrl}: ${String(err)}`,
@@ -773,4 +947,3 @@ export default redisMemoryPlugin;
 export { memoryConfigSchema, parseMemoryConfig } from "./config.js";
 export type { MemoryConfig, MemoryStrategy, SummaryGroupByField } from "./config.js";
 export type { PluginApi, PluginDefinition, ToolDefinition, ToolResult } from "./types.js";
-
