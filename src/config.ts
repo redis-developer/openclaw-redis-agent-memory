@@ -17,6 +17,26 @@ export type MemoryStrategy = "discrete" | "summary" | "preferences" | "custom";
  */
 export type SummaryGroupByField = "user_id" | "namespace";
 
+export type MemoryScopeConfig = {
+  label?: string;
+  namespace?: string;
+  userId?: string;
+  workingMemorySessionId?: string;
+  extractionStrategy?: MemoryStrategy;
+  customPrompt?: string;
+  summaryViewName?: string;
+  summaryTimeWindowDays?: number;
+  summaryGroupBy?: SummaryGroupByField[];
+};
+
+export type AgentMemoryRoute = {
+  primaryScope: string;
+  recallScopes?: string[];
+  captureScopes?: string[];
+  toolScopes?: string[];
+  defaultStoreScope?: string;
+};
+
 export type MemoryConfig = {
   /** Base URL of the agent-memory-server (e.g., 'http://localhost:8000') */
   serverUrl: string;
@@ -60,6 +80,10 @@ export type MemoryConfig = {
   storeDescription?: string;
   /** Custom description for the memory_forget tool */
   forgetDescription?: string;
+  /** Optional named memory boundaries for multi-agent setups */
+  scopes?: Record<string, MemoryScopeConfig>;
+  /** Optional routing from OpenClaw agent id to named scopes */
+  agentScopes?: Record<string, AgentMemoryRoute>;
 };
 
 export const DEFAULT_SERVER_URL = "http://localhost:8000";
@@ -67,7 +91,7 @@ export const DEFAULT_TIMEOUT = 30000;
 export const DEFAULT_MIN_SCORE = 0.3;
 export const DEFAULT_RECALL_LIMIT = 3;
 export const DEFAULT_NAMESPACE = "default";
-export const DEFAULT_USER_ID = "default";
+export const USER_ID_PLACEHOLDER = "user-123";
 export const DEFAULT_SUMMARY_VIEW_NAME = "agent_user_summary";
 export const DEFAULT_SUMMARY_TIME_WINDOW_DAYS = 30;
 export const DEFAULT_SUMMARY_GROUP_BY: SummaryGroupByField[] = ["user_id"];
@@ -97,6 +121,133 @@ function resolveEnvVars(value: string): string {
   });
 }
 
+function sanitizeScopeKey(key: string): string {
+  return key.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_") || "default";
+}
+
+function resolveOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? resolveEnvVars(value) : undefined;
+}
+
+function parseStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const parsed = value.filter(
+    (entry): entry is string => typeof entry === "string" && entry.trim().length > 0,
+  );
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+function parseSummaryGroupBy(
+  value: unknown,
+  fallback: SummaryGroupByField[],
+): SummaryGroupByField[] {
+  if (!Array.isArray(value)) return fallback;
+
+  const validFields: SummaryGroupByField[] = ["user_id", "namespace"];
+  const parsed = value.filter(
+    (field): field is SummaryGroupByField =>
+      typeof field === "string" && validFields.includes(field as SummaryGroupByField),
+  );
+
+  return parsed.length > 0 ? parsed : fallback;
+}
+
+function parseScopeConfig(
+  key: string,
+  value: unknown,
+  defaults: {
+    namespace?: string;
+    userId?: string;
+    workingMemorySessionId?: string;
+    extractionStrategy?: MemoryStrategy;
+    customPrompt?: string;
+    summaryViewName: string;
+    summaryTimeWindowDays: number;
+    summaryGroupBy: SummaryGroupByField[];
+  },
+): MemoryScopeConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`memory scope "${key}" must be an object`);
+  }
+
+  const scope = value as Record<string, unknown>;
+  assertAllowedKeys(
+    scope,
+    [
+      "label",
+      "namespace",
+      "userId",
+      "workingMemorySessionId",
+      "extractionStrategy",
+      "customPrompt",
+      "summaryViewName",
+      "summaryTimeWindowDays",
+      "summaryGroupBy",
+    ],
+    `memory scope "${key}"`,
+  );
+
+  let extractionStrategy = defaults.extractionStrategy;
+  if (typeof scope.extractionStrategy === "string") {
+    if (!VALID_STRATEGIES.includes(scope.extractionStrategy as MemoryStrategy)) {
+      throw new Error(
+        `Invalid extractionStrategy in scope "${key}": ${scope.extractionStrategy}. Must be one of: ${VALID_STRATEGIES.join(", ")}`,
+      );
+    }
+    extractionStrategy = scope.extractionStrategy as MemoryStrategy;
+  }
+
+  const customPrompt = resolveOptionalString(scope.customPrompt) ?? defaults.customPrompt;
+  if (extractionStrategy === "custom" && !customPrompt) {
+    throw new Error(`customPrompt is required for custom extractionStrategy in scope "${key}"`);
+  }
+
+  return {
+    label: resolveOptionalString(scope.label),
+    namespace: resolveOptionalString(scope.namespace) ?? defaults.namespace,
+    userId: resolveOptionalString(scope.userId) ?? defaults.userId,
+    workingMemorySessionId:
+      resolveOptionalString(scope.workingMemorySessionId) ?? defaults.workingMemorySessionId,
+    extractionStrategy,
+    customPrompt,
+    summaryViewName:
+      resolveOptionalString(scope.summaryViewName) ??
+      `${defaults.summaryViewName}_${sanitizeScopeKey(key)}`,
+    summaryTimeWindowDays:
+      typeof scope.summaryTimeWindowDays === "number" &&
+      Number.isFinite(scope.summaryTimeWindowDays)
+        ? Math.max(1, Math.floor(scope.summaryTimeWindowDays))
+        : defaults.summaryTimeWindowDays,
+    summaryGroupBy: parseSummaryGroupBy(scope.summaryGroupBy, defaults.summaryGroupBy),
+  };
+}
+
+function parseAgentMemoryRoute(key: string, value: unknown): AgentMemoryRoute {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`agent scope route "${key}" must be an object`);
+  }
+
+  const route = value as Record<string, unknown>;
+  assertAllowedKeys(
+    route,
+    ["primaryScope", "recallScopes", "captureScopes", "toolScopes", "defaultStoreScope"],
+    `agent scope route "${key}"`,
+  );
+
+  if (typeof route.primaryScope !== "string" || route.primaryScope.trim().length === 0) {
+    throw new Error(`agent scope route "${key}" requires primaryScope`);
+  }
+
+  return {
+    primaryScope: route.primaryScope,
+    recallScopes: parseStringList(route.recallScopes),
+    captureScopes: parseStringList(route.captureScopes),
+    toolScopes: parseStringList(route.toolScopes),
+    defaultStoreScope:
+      typeof route.defaultStoreScope === "string" ? route.defaultStoreScope : undefined,
+  };
+}
+
 const ALLOWED_CONFIG_KEYS = [
   "serverUrl",
   "apiKey",
@@ -117,6 +268,8 @@ const ALLOWED_CONFIG_KEYS = [
   "recallDescription",
   "storeDescription",
   "forgetDescription",
+  "scopes",
+  "agentScopes",
 ];
 
 const VALID_STRATEGIES = ["discrete", "summary", "preferences", "custom"] as const;
@@ -151,16 +304,83 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
     );
   }
 
-  // Parse and validate summaryGroupBy
-  let summaryGroupBy: SummaryGroupByField[] = DEFAULT_SUMMARY_GROUP_BY;
-  if (Array.isArray(cfg.summaryGroupBy)) {
-    const validFields: SummaryGroupByField[] = ["user_id", "namespace"];
-    const parsed = cfg.summaryGroupBy.filter(
-      (f): f is SummaryGroupByField =>
-        typeof f === "string" && validFields.includes(f as SummaryGroupByField),
+  const summaryGroupBy = parseSummaryGroupBy(cfg.summaryGroupBy, DEFAULT_SUMMARY_GROUP_BY);
+
+  const parsedNamespace =
+    typeof cfg.namespace === "string" ? resolveEnvVars(cfg.namespace) : DEFAULT_NAMESPACE;
+  const parsedUserId =
+    typeof cfg.userId === "string" ? resolveEnvVars(cfg.userId) : undefined;
+  const parsedWorkingMemorySessionId =
+    typeof cfg.workingMemorySessionId === "string"
+      ? resolveEnvVars(cfg.workingMemorySessionId)
+      : undefined;
+  const parsedSummaryViewName =
+    typeof cfg.summaryViewName === "string"
+      ? resolveEnvVars(cfg.summaryViewName)
+      : DEFAULT_SUMMARY_VIEW_NAME;
+  const parsedSummaryTimeWindowDays =
+    typeof cfg.summaryTimeWindowDays === "number" &&
+    Number.isFinite(cfg.summaryTimeWindowDays)
+      ? Math.max(1, Math.floor(cfg.summaryTimeWindowDays))
+      : DEFAULT_SUMMARY_TIME_WINDOW_DAYS;
+
+  let scopes: Record<string, MemoryScopeConfig> | undefined;
+  if (cfg.scopes !== undefined) {
+    if (!cfg.scopes || typeof cfg.scopes !== "object" || Array.isArray(cfg.scopes)) {
+      throw new Error("scopes must be an object");
+    }
+
+    scopes = Object.fromEntries(
+      Object.entries(cfg.scopes as Record<string, unknown>).map(([key, scopeValue]) => [
+        key,
+        parseScopeConfig(key, scopeValue, {
+          namespace: parsedNamespace,
+          userId: parsedUserId,
+          workingMemorySessionId: parsedWorkingMemorySessionId,
+          extractionStrategy,
+          customPrompt,
+          summaryViewName: parsedSummaryViewName,
+          summaryTimeWindowDays: parsedSummaryTimeWindowDays,
+          summaryGroupBy,
+        }),
+      ]),
     );
-    if (parsed.length > 0) {
-      summaryGroupBy = parsed;
+  }
+
+  let agentScopes: Record<string, AgentMemoryRoute> | undefined;
+  if (cfg.agentScopes !== undefined) {
+    if (!cfg.agentScopes || typeof cfg.agentScopes !== "object" || Array.isArray(cfg.agentScopes)) {
+      throw new Error("agentScopes must be an object");
+    }
+
+    agentScopes = Object.fromEntries(
+      Object.entries(cfg.agentScopes as Record<string, unknown>).map(([key, routeValue]) => [
+        key,
+        parseAgentMemoryRoute(key, routeValue),
+      ]),
+    );
+  }
+
+  if (agentScopes && !scopes) {
+    throw new Error("agentScopes requires scopes to also be configured");
+  }
+
+  if (scopes && agentScopes) {
+    const scopeNames = new Set(Object.keys(scopes));
+    for (const [agentId, route] of Object.entries(agentScopes)) {
+      const referencedScopes = [
+        route.primaryScope,
+        ...(route.recallScopes ?? []),
+        ...(route.captureScopes ?? []),
+        ...(route.toolScopes ?? []),
+        ...(route.defaultStoreScope ? [route.defaultStoreScope] : []),
+      ];
+
+      for (const scopeName of referencedScopes) {
+        if (!scopeNames.has(scopeName)) {
+          throw new Error(`agentScopes.${agentId} references unknown scope "${scopeName}"`);
+        }
+      }
     }
   }
 
@@ -169,12 +389,11 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
     apiKey: typeof cfg.apiKey === "string" ? resolveEnvVars(cfg.apiKey) : undefined,
     bearerToken:
       typeof cfg.bearerToken === "string" ? resolveEnvVars(cfg.bearerToken) : undefined,
-    namespace: typeof cfg.namespace === "string" ? cfg.namespace : DEFAULT_NAMESPACE,
+    namespace: parsedNamespace,
     // Default to undefined - only pass user_id when explicitly set
     // (client library v0.3.x doesn't pass user_id on GET, causing key mismatch)
-    userId: typeof cfg.userId === "string" ? cfg.userId : undefined,
-    workingMemorySessionId:
-      typeof cfg.workingMemorySessionId === "string" ? cfg.workingMemorySessionId : undefined,
+    userId: parsedUserId,
+    workingMemorySessionId: parsedWorkingMemorySessionId,
     timeout:
       typeof cfg.timeout === "number" && Number.isFinite(cfg.timeout)
         ? cfg.timeout
@@ -191,15 +410,8 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
         : DEFAULT_RECALL_LIMIT,
     extractionStrategy,
     customPrompt,
-    summaryViewName:
-      typeof cfg.summaryViewName === "string"
-        ? cfg.summaryViewName
-        : DEFAULT_SUMMARY_VIEW_NAME,
-    summaryTimeWindowDays:
-      typeof cfg.summaryTimeWindowDays === "number" &&
-      Number.isFinite(cfg.summaryTimeWindowDays)
-        ? Math.max(1, Math.floor(cfg.summaryTimeWindowDays))
-        : DEFAULT_SUMMARY_TIME_WINDOW_DAYS,
+    summaryViewName: parsedSummaryViewName,
+    summaryTimeWindowDays: parsedSummaryTimeWindowDays,
     summaryGroupBy,
     recallDescription:
       typeof cfg.recallDescription === "string"
@@ -213,6 +425,8 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
       typeof cfg.forgetDescription === "string"
         ? cfg.forgetDescription
         : DEFAULT_FORGET_DESCRIPTION,
+    scopes,
+    agentScopes,
   };
 }
 
@@ -243,17 +457,17 @@ export const memoryConfigSchema = {
     namespace: {
       label: "Namespace",
       placeholder: DEFAULT_NAMESPACE,
-      help: "Namespace for organizing memories (isolates memories by project/app)",
+      help: "Namespace for organizing memories (isolates memories by app, team, or project)",
     },
     userId: {
       label: "User ID",
-      placeholder: DEFAULT_USER_ID,
-      help: "User ID for memory isolation (each user gets their own memories)",
+      placeholder: USER_ID_PLACEHOLDER,
+      help: "Optional. Set explicitly for per-user isolation. If omitted, memory is scoped only by namespace.",
     },
     workingMemorySessionId: {
       label: "Working Memory Session ID",
       placeholder: "my-session",
-      help: "Fixed session ID for working memory. If set, uses this instead of deriving from OpenClaw session. Useful for continuous memory across sessions.",
+      help: "Fixed session ID for working memory. If set, uses this instead of deriving from OpenClaw session. Useful for demos that should keep one continuous session.",
       advanced: true,
     },
     timeout: {
@@ -338,6 +552,15 @@ export const memoryConfigSchema = {
       multiline: true,
       advanced: true,
     },
+    scopes: {
+      label: "Named Scopes",
+      help: "Optional named memory boundaries for multi-agent setups. Each scope can override namespace, userId, extraction, and summary settings.",
+      advanced: true,
+    },
+    agentScopes: {
+      label: "Agent Scope Routing",
+      help: "Optional mapping from OpenClaw agent ID to named scopes for recall, capture, and tool defaults.",
+      advanced: true,
+    },
   },
 };
-

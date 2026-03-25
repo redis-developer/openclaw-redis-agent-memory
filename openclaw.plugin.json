@@ -23,12 +23,18 @@
     "namespace": {
       "label": "Namespace",
       "placeholder": "default",
-      "help": "Namespace for organizing memories (isolates memories by project/app)"
+      "help": "Namespace for organizing memories (isolates memories by app, team, or project)"
     },
     "userId": {
       "label": "User ID",
-      "placeholder": "default",
-      "help": "User ID for memory isolation (each user gets their own memories)"
+      "placeholder": "user-123",
+      "help": "Optional. Set explicitly for per-user isolation. If omitted, memory is scoped only by namespace."
+    },
+    "workingMemorySessionId": {
+      "label": "Working Memory Session ID",
+      "placeholder": "my-session",
+      "help": "Fixed session ID for working memory. If set, uses this instead of deriving from the OpenClaw session. Useful for demos that should keep one continuous session.",
+      "advanced": true
     },
     "timeout": {
       "label": "Timeout (ms)",
@@ -102,6 +108,16 @@
       "placeholder": "Delete specific memories. GDPR-compliant.",
       "help": "Description shown to the LLM for the memory_forget tool",
       "advanced": true
+    },
+    "scopes": {
+      "label": "Named Scopes",
+      "help": "Optional named memory boundaries for multi-agent setups. Each scope can override namespace, userId, extraction, and summary settings.",
+      "advanced": true
+    },
+    "agentScopes": {
+      "label": "Agent Scope Routing",
+      "help": "Optional mapping from OpenClaw agent ID to named scopes for recall, capture, and tool defaults.",
+      "advanced": true
     }
   },
   "configSchema": {
@@ -113,6 +129,7 @@
       "bearerToken": { "type": "string" },
       "namespace": { "type": "string" },
       "userId": { "type": "string" },
+      "workingMemorySessionId": { "type": "string" },
       "timeout": { "type": "number" },
       "autoCapture": { "type": "boolean" },
       "autoRecall": { "type": "boolean" },
@@ -131,8 +148,55 @@
       },
       "recallDescription": { "type": "string" },
       "storeDescription": { "type": "string" },
-      "forgetDescription": { "type": "string" }
+      "forgetDescription": { "type": "string" },
+      "scopes": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "label": { "type": "string" },
+            "namespace": { "type": "string" },
+            "userId": { "type": "string" },
+            "workingMemorySessionId": { "type": "string" },
+            "extractionStrategy": {
+              "type": "string",
+              "enum": ["discrete", "summary", "preferences", "custom"]
+            },
+            "customPrompt": { "type": "string" },
+            "summaryViewName": { "type": "string" },
+            "summaryTimeWindowDays": { "type": "number", "minimum": 1 },
+            "summaryGroupBy": {
+              "type": "array",
+              "items": { "type": "string", "enum": ["user_id", "namespace"] }
+            }
+          }
+        }
+      },
+      "agentScopes": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "primaryScope": { "type": "string" },
+            "recallScopes": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "captureScopes": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "toolScopes": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "defaultStoreScope": { "type": "string" }
+          },
+          "required": ["primaryScope"]
+        }
+      }
     }
   }
 }
-
