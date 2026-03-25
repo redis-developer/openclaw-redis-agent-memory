@@ -74,7 +74,7 @@ Edit `~/.openclaw/openclaw.json`:
         "enabled": true,
         "config": {
           "serverUrl": "http://localhost:8000",
-          "namespace": "hackathon-demo",
+          "namespace": "project-memory",
           "userId": "demo-user"
         }
       }
@@ -97,7 +97,7 @@ Use a deterministic smoke test before building on top of the plugin:
 {
   "tool": "memory_store",
   "arguments": {
-    "text": "Hackathon team name is Vector Cats",
+    "text": "Project code name is Vector Cats",
     "category": "entity"
   }
 }
@@ -109,7 +109,7 @@ Use a deterministic smoke test before building on top of the plugin:
 {
   "tool": "memory_recall",
   "arguments": {
-    "query": "hackathon team name",
+    "query": "project code name",
     "limit": 3
   }
 }
@@ -117,9 +117,9 @@ Use a deterministic smoke test before building on top of the plugin:
 
 If recall works, your server URL, namespace, auth, and plugin wiring are all in a good state.
 
-## Hackathon Setup Recipes
+## Implementation Patterns
 
-### Shared Team Memory
+### Shared Memory
 
 Use one shared `namespace` and leave `userId` unset:
 
@@ -130,25 +130,25 @@ Use one shared `namespace` and leave `userId` unset:
 }
 ```
 
-This is the fastest setup when the whole team should see the same long-term memory.
+This is the fastest setup when multiple users or agents should share the same long-term memory.
 
 ### Per-User Isolation
 
-Use the same `namespace`, but assign each participant their own `userId`:
+Use the same `namespace`, but assign each user their own `userId`:
 
 ```json
 {
   "serverUrl": "http://localhost:8000",
-  "namespace": "hackathon-demo",
-  "userId": "aditi"
+  "namespace": "project-memory",
+  "userId": "user-123"
 }
 ```
 
-This keeps memories isolated per person while still grouping the project under one namespace.
+This keeps memories isolated per user while still grouping the application under one namespace.
 
 ### Shared Plus Personal Memory Across Agents
 
-For multi-agent demos, define named scopes and route each OpenClaw agent to the right memory boundary:
+For multi-agent implementations, define named scopes and route each OpenClaw agent to the right memory boundary:
 
 ```json
 {
@@ -158,30 +158,30 @@ For multi-agent demos, define named scopes and route each OpenClaw agent to the 
         "enabled": true,
         "config": {
           "serverUrl": "http://localhost:8000",
-          "namespace": "hackathon-demo",
+          "namespace": "project-memory",
           "scopes": {
-            "team": {
-              "label": "Team Shared"
+            "shared": {
+              "label": "Shared Memory"
             },
-            "aditi": {
-              "label": "Aditi Personal",
-              "userId": "aditi"
+            "personal": {
+              "label": "Personal Memory",
+              "userId": "user-123"
             },
             "research": {
-              "label": "Research Shared"
+              "label": "Research Memory"
             }
           },
           "agentScopes": {
             "main": {
-              "primaryScope": "team",
-              "recallScopes": ["team", "aditi"],
-              "toolScopes": ["team", "aditi"],
-              "defaultStoreScope": "team"
+              "primaryScope": "shared",
+              "recallScopes": ["shared", "personal"],
+              "toolScopes": ["shared", "personal"],
+              "defaultStoreScope": "shared"
             },
             "researcher": {
               "primaryScope": "research",
-              "recallScopes": ["team", "research"],
-              "toolScopes": ["team", "research"],
+              "recallScopes": ["shared", "research"],
+              "toolScopes": ["shared", "research"],
               "defaultStoreScope": "research"
             }
           }
@@ -222,9 +222,9 @@ When multiple scopes are available, the manual memory tools expose an optional `
 
 ### Notes on Isolation
 
-- `namespace` is the broadest isolation boundary. It is usually the right place to separate apps, demos, or hackathon projects.
+- `namespace` is the broadest isolation boundary. It is usually the right place to separate apps, environments, or product areas.
 - `userId` is optional. If you do not set it, memory is scoped only by `namespace`.
-- For stable demos, prefer setting `userId` explicitly whenever memory should stay isolated to one person or one bot persona.
+- For stable deployments or repeatable demos, prefer setting `userId` explicitly whenever memory should stay isolated to one person or one bot persona.
 
 ### Notes on Multi-Agent Routing
 
@@ -364,7 +364,7 @@ import redisMemoryPlugin, {
 
 const pluginConfig = memoryConfigSchema.parse({
   serverUrl: "http://localhost:8000",
-  namespace: "hackathon-demo",
+  namespace: "project-memory",
   userId: "demo-user",
 });
 
@@ -384,7 +384,7 @@ The plugin reads configuration from `api.pluginConfig`, so make sure the parsed 
 - If auto-recall seems empty, verify that you are using the same `namespace` and `userId` across sessions.
 - If you use `extractionStrategy: "custom"`, you must also set `customPrompt`.
 - If you use `agentScopes`, every referenced scope must exist in `scopes`.
-- If you want one shared memory pool for a demo, leave `userId` unset. If you want isolated memory, set it explicitly.
+- If you want one shared memory pool for an implementation, leave `userId` unset. If you want isolated memory, set it explicitly.
 
 ## Links
 
