@@ -827,12 +827,24 @@ const redisMemoryPlugin: PluginDefinition = {
             try {
               const filtered = await searchScope(scope, searchQuery, cfg.recallLimit ?? 3);
               if (filtered.length > 0) {
-                const memoryList = filtered.map((memory) => `- ${memory.text}`).join("\n");
+                // Dedup by text content — the memory server can store
+                // the same text across different sessions (e.g. repeated
+                // workspace-update instructions). Without this, the
+                // <relevant-memories> block contains 2-3 identical
+                // bullets, wasting ~67% of the injection token budget.
+                const seen = new Set<string>();
+                const unique = filtered.filter((m) => {
+                  const key = (m.text || "").trim();
+                  if (!key || seen.has(key)) return false;
+                  seen.add(key);
+                  return true;
+                });
+                const memoryList = unique.map((memory) => `- ${memory.text}`).join("\n");
                 scopedContextParts.push(
                   `<relevant-memories query-specific="true">\n${memoryList}\n</relevant-memories>`,
                 );
                 api.logger.info?.(
-                  `redis-memory: injecting ${filtered.length} query-specific memories for scope "${scope.key}"`,
+                  `redis-memory: injecting ${unique.length}/${filtered.length} query-specific memories (deduped) for scope "${scope.key}"`,
                 );
               }
             } catch (err) {
