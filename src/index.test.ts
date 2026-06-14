@@ -147,6 +147,34 @@ describe("redis-memory plugin", () => {
     ).toThrow(/unknown scope "missing"/i);
   });
 
+  test("config schema parses hooks entitlements", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+
+    const config = memoryPlugin.configSchema?.parse?.({
+      serverUrl: "http://localhost:8000",
+      hooks: {
+        allowConversationAccess: true,
+      },
+    });
+
+    expect(config?.hooks).toBeDefined();
+    expect(config?.hooks?.allowConversationAccess).toBe(true);
+  });
+
+  test("config schema rejects unknown hook configurations", async () => {
+    const { default: memoryPlugin } = await import("./index.js");
+
+    expect(() =>
+      memoryPlugin.configSchema?.parse?.({
+        serverUrl: "http://localhost:8000",
+        hooks: {
+          allowConversationAccess: true,
+          unsupportedHook: true,
+        },
+      }),
+    ).toThrow(/hooks has unknown keys: unsupportedHook/i);
+  });
+
   test("shouldCapture filters correctly", async () => {
     // Test the capture filtering logic by checking the rules
     const triggers = [

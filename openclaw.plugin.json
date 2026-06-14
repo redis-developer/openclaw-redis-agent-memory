@@ -1,6 +1,13 @@
 {
   "id": "openclaw-redis-agent-memory",
   "kind": "memory",
+  "contracts": {
+    "tools": [
+      "memory_recall",
+      "memory_store",
+      "memory_forget"
+    ]
+  },
   "uiHints": {
     "serverUrl": {
       "label": "Server URL",
@@ -195,6 +202,13 @@
             "defaultStoreScope": { "type": "string" }
           },
           "required": ["primaryScope"]
+        }
+      },
+      "hooks": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "allowConversationAccess": { "type": "boolean" }
         }
       }
     }

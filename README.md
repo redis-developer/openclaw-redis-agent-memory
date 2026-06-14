@@ -385,6 +385,8 @@ The plugin reads configuration from `api.pluginConfig`, so make sure the parsed 
 - If you use `extractionStrategy: "custom"`, you must also set `customPrompt`.
 - If you use `agentScopes`, every referenced scope must exist in `scopes`.
 - If you want one shared memory pool for an implementation, leave `userId` unset. If you want isolated memory, set it explicitly.
+- If OpenClaw logs `plugin must declare contracts.tools`, ensure your version of the plugin includes the `contracts` block in `openclaw.plugin.json`. Wildcard entries like `"tools": ["*"]` are rejected; each tool must be listed explicitly.
+- If the `agent_end` hook (auto-capture) is silently blocked, add `"hooks": { "allowConversationAccess": true }` to your plugin config in `~/.openclaw/openclaw.json`.
 
 ## Links
 
