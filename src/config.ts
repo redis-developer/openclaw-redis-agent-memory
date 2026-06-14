@@ -84,6 +84,10 @@ export type MemoryConfig = {
   scopes?: Record<string, MemoryScopeConfig>;
   /** Optional routing from OpenClaw agent id to named scopes */
   agentScopes?: Record<string, AgentMemoryRoute>;
+  /** Hook entitlements for the plugin (e.g., conversation access for agent_end) */
+  hooks?: {
+    allowConversationAccess?: boolean;
+  };
 };
 
 export const DEFAULT_SERVER_URL = "http://localhost:8000";
@@ -270,6 +274,7 @@ const ALLOWED_CONFIG_KEYS = [
   "forgetDescription",
   "scopes",
   "agentScopes",
+  "hooks",
 ];
 
 const VALID_STRATEGIES = ["discrete", "summary", "preferences", "custom"] as const;
@@ -365,6 +370,22 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
     throw new Error("agentScopes requires scopes to also be configured");
   }
 
+  // Parse hooks entitlements
+  let hooks: { allowConversationAccess?: boolean } | undefined;
+  if (cfg.hooks !== undefined) {
+    if (!cfg.hooks || typeof cfg.hooks !== "object" || Array.isArray(cfg.hooks)) {
+      throw new Error("hooks must be an object");
+    }
+    const hooksObj = cfg.hooks as Record<string, unknown>;
+    assertAllowedKeys(hooksObj, ["allowConversationAccess"], "hooks");
+    hooks = {
+      allowConversationAccess:
+        typeof hooksObj.allowConversationAccess === "boolean"
+          ? hooksObj.allowConversationAccess
+          : undefined,
+    };
+  }
+
   if (scopes && agentScopes) {
     const scopeNames = new Set(Object.keys(scopes));
     for (const [agentId, route] of Object.entries(agentScopes)) {
@@ -427,6 +448,7 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
         : DEFAULT_FORGET_DESCRIPTION,
     scopes,
     agentScopes,
+    hooks,
   };
 }
 
