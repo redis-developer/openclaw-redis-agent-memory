@@ -2,23 +2,36 @@
   "id": "openclaw-redis-agent-memory",
   "kind": "memory",
   "uiHints": {
+    "provider": {
+      "label": "Backend",
+      "help": "Which backend to use. Defaults to \"cloud\" (Redis Agent Memory) unless an existing self-hosted config is detected.",
+      "options": [
+        { "value": "cloud", "label": "Redis Agent Memory (cloud, default)" },
+        { "value": "self-hosted", "label": "Self-hosted agent-memory-server" }
+      ]
+    },
     "serverUrl": {
       "label": "Server URL",
       "placeholder": "http://localhost:8000",
-      "help": "Base URL of the agent-memory-server (or use ${AGENT_MEMORY_SERVER_URL})"
+      "help": "Base URL of the backend: the Redis Agent Memory cloud endpoint (falls back to ${AGENT_MEMORY_ENDPOINT}) when using the cloud provider, or the self-hosted agent-memory-server URL otherwise."
     },
     "apiKey": {
       "label": "API Key",
       "sensitive": true,
       "placeholder": "your-api-key",
-      "help": "API key for authentication (optional, or use ${AGENT_MEMORY_API_KEY})"
+      "help": "API key for authentication. Required for the cloud provider (sent as the Redis Agent Memory bearer token; falls back to ${AGENT_MEMORY_API_KEY}). Optional for self-hosted."
     },
     "bearerToken": {
       "label": "Bearer Token",
       "sensitive": true,
       "placeholder": "your-bearer-token",
-      "help": "Bearer token for authentication (optional)",
+      "help": "Bearer token for authentication (self-hosted only; optional). Not supported with the cloud provider — use API Key instead.",
       "advanced": true
+    },
+    "storeId": {
+      "label": "Store ID",
+      "placeholder": "your-store-id",
+      "help": "Redis Agent Memory store id (cloud provider only, or use ${AGENT_MEMORY_STORE_ID})"
     },
     "namespace": {
       "label": "Namespace",
@@ -124,9 +137,11 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "provider": { "type": "string", "enum": ["cloud", "self-hosted"] },
       "serverUrl": { "type": "string" },
       "apiKey": { "type": "string" },
       "bearerToken": { "type": "string" },
+      "storeId": { "type": "string" },
       "namespace": { "type": "string" },
       "userId": { "type": "string" },
       "workingMemorySessionId": { "type": "string" },

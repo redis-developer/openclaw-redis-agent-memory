@@ -1,25 +1,47 @@
 /**
- * Agent Memory Plugin
+ * Redis Agent Memory Plugin
  *
- * Long-term memory with vector search for AI conversations.
- * Uses agent-memory-server (Redis-backed) for storage and semantic search.
+ * Long-term memory with vector search for AI conversations, backed by
+ * Redis Agent Memory.
+ *
+ * ## Backends
+ *
+ * - **cloud** (default): the managed Redis Agent Memory service. Requires
+ *   `apiKey` and `storeId` (or the `AGENT_MEMORY_*` env fallbacks); memory
+ *   extraction and summarization happen automatically, server-side, with no
+ *   client configuration.
+ * - **self-hosted**: the open-source `agent-memory-server`. Backwards
+ *   compatible with existing `serverUrl`-only configs (auto-detected).
+ *
+ * `providers/factory.ts` picks the implementation from the resolved config so
+ * the rest of this file stays backend-agnostic; see `provider.ts` for the
+ * shared interface and capability flags.
  *
  * Features:
  * - Auto-recall: Semantic search for relevant long-term memories
  * - Auto-capture: Saves conversation to working memory for background extraction
  * - Manual tools: Store, search, and forget memories explicitly
+ * - Extraction strategies (self-hosted only): configure how the self-hosted
+ *   server extracts memories from conversations. The cloud backend always
+ *   extracts automatically and ignores this setting.
+ * - Summary views (self-hosted only): rolling summaries of long-term
+ *   memories for stable context. Not available on the cloud backend.
  *
- * The server handles memory extraction in the background, keeping the client fast.
+ * On self-hosted, the server handles memory extraction in the background,
+ * keeping the client fast. On cloud, extraction happens server-side with no
+ * client configuration at all.
  *
  * ## Memory Retrieval
  *
- * The plugin uses semantic search (`searchLongTermMemory`) for auto-recall.
- * Conversation history is handled separately, so we only inject long-term
- * memories - not working memory (recent messages).
+ * The plugin uses long-term memory search for auto-recall. Conversation
+ * history is handled separately, so we only inject long-term memories - not
+ * working memory (recent messages).
  *
- * ## Extraction Strategies
+ * ## Extraction Strategies (self-hosted only)
  *
- * Configure how the server extracts memories from conversations:
+ * Configure how the self-hosted server extracts memories from conversations.
+ * The cloud backend (Redis Agent Memory) ignores this setting and always
+ * extracts automatically, server-side.
  *
  * - **discrete** (default): Extract semantic and episodic memories
  * - **summary**: Maintain a running summary of the conversation
@@ -28,16 +50,16 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { MemoryAPIClient, MemoryNotFoundError } from "agent-memory-client";
-import type { MemoryMessage } from "agent-memory-client";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { type MemoryConfig, memoryConfigSchema } from "./config.js";
+import { memoryConfigSchema } from "./config.js";
 import type { PluginApi, PluginDefinition } from "./types.js";
 import { stringEnum } from "./types.js";
+import { createProvider } from "./providers/factory.js";
+import type { CapturedMessage } from "./provider.js";
 import {
   getConfiguredScopes,
   resolveAgentScopePlan,
@@ -91,7 +113,7 @@ type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 type MemorySearchResult = {
   id: string;
   text: string;
-  score: number;
+  score?: number;
   category?: string;
   topics?: string[];
   entities?: string[];
@@ -153,11 +175,11 @@ function stripEnvelopeForSearch(text: string): string {
 }
 
 /**
- * Convert messages to MemoryMessage format for working memory.
+ * Convert messages to the backend-neutral CapturedMessage format.
  * Preserves original timestamps from pi-ai messages to enable deduplication.
  */
-export function convertToMemoryMessages(messages: unknown[]): MemoryMessage[] {
-  const result: MemoryMessage[] = [];
+export function convertToMemoryMessages(messages: unknown[]): CapturedMessage[] {
+  const result: CapturedMessage[] = [];
 
   for (const msg of messages) {
     if (!msg || typeof msg !== "object") continue;
@@ -183,7 +205,7 @@ export function convertToMemoryMessages(messages: unknown[]): MemoryMessage[] {
       role,
       content,
       id: typeof msgObj.id === "string" ? msgObj.id : randomUUID(),
-      created_at: new Date(msgTimestamp).toISOString(),
+      timestampMs: msgTimestamp,
     });
   }
 
@@ -216,23 +238,41 @@ const redisMemoryPlugin: PluginDefinition = {
 
   register(api: PluginApi) {
     const cfg = memoryConfigSchema.parse(api.pluginConfig);
-    const client = new MemoryAPIClient({
-      baseUrl: cfg.serverUrl,
-      apiKey: cfg.apiKey,
-      bearerToken: cfg.bearerToken,
-      defaultNamespace: cfg.namespace,
-      timeout: cfg.timeout,
-    });
+    const provider = createProvider(cfg, api.logger);
 
-    api.logger.info?.(
-      `redis-memory: plugin registered (server: ${cfg.serverUrl}, namespace: ${cfg.namespace ?? "default"})`,
-    );
+    // Whether this backend returns per-result similarity scores. Gates the
+    // "(NN%)" recall suffix and score-based sorting/auto-delete below.
+    // AMS (self-hosted): true; RAM (cloud): false.
+    const showScores = provider.capabilities.similarityScores;
+
+    const namespaceLabel = cfg.namespace ?? "default";
+    if (cfg.provider === "cloud") {
+      // Never log apiKey/bearerToken. storeId identifies the cloud tenant.
+      api.logger.info?.(
+        `redis-memory: plugin registered (backend: cloud, server: ${cfg.serverUrl}, storeId: ${cfg.storeId}, namespace: ${namespaceLabel})`,
+      );
+    } else {
+      api.logger.info?.(
+        `redis-memory: plugin registered (backend: self-hosted, server: ${cfg.serverUrl}, namespace: ${namespaceLabel})`,
+      );
+    }
+
+    // One-time notice at registration (never per turn): the cloud backend
+    // ignores extraction/summary-view options because Redis Agent Memory
+    // extracts memories server-side. `cloudIgnoredOptions` is always [] for
+    // self-hosted, so this branch never fires there.
+    if (cfg.provider === "cloud" && cfg.cloudIgnoredOptions.length > 0) {
+      api.logger.warn(
+        "redis-memory: the following options are ignored on the cloud backend " +
+          "(Redis Agent Memory extracts memories server-side; extraction and " +
+          "summary-view options apply only to the self-hosted backend): " +
+          cfg.cloudIgnoredOptions.join(", "),
+      );
+    }
 
     // ========================================================================
     // Scope helpers
     // ========================================================================
-
-    const summaryViewIds = new Map<string, string | null>();
 
     // Track max message timestamp per session/scope pair to avoid re-sending messages
     const sessionMaxTimestamps = new Map<string, number>();
@@ -268,76 +308,31 @@ const redisMemoryPlugin: PluginDefinition = {
       return ` Available scopes: ${scopeList}.${defaultText}`;
     }
 
-    async function ensureSummaryView(scope: ScopedMemoryTarget): Promise<string | null> {
-      try {
-        const views = await client.listSummaryViews();
-        const existing = views.find((view) => view.name === scope.summaryViewName);
-
-        if (existing) {
-          api.logger.info?.(
-            `redis-memory: using existing summary view "${scope.summaryViewName}" for scope "${scope.key}" (id: ${existing.id})`,
-          );
-          summaryViewIds.set(scope.key, existing.id);
-          return existing.id;
-        }
-
-        const filters: Record<string, unknown> = {};
-        if (scope.namespace) {
-          filters.namespace = scope.namespace;
-        }
-
-        const newView = await client.createSummaryView({
-          name: scope.summaryViewName,
-          source: "long_term",
-          group_by: scope.summaryGroupBy,
-          filters: Object.keys(filters).length > 0 ? filters : undefined,
-          time_window_days: scope.summaryTimeWindowDays,
-          continuous: false,
-          prompt:
-            "Summarize key facts, preferences, decisions, and important context about the user. " +
-            "Focus on information that would be useful for future conversations. " +
-            "Be concise but comprehensive.",
-        });
-
-        api.logger.info?.(
-          `redis-memory: created summary view "${scope.summaryViewName}" for scope "${scope.key}" (id: ${newView.id})`,
-        );
-        summaryViewIds.set(scope.key, newView.id);
-        return newView.id;
-      } catch (err) {
-        api.logger.warn(
-          `redis-memory: failed to initialize summary view for scope "${scope.key}": ${String(err)}`,
-        );
-        summaryViewIds.set(scope.key, null);
-        return null;
-      }
-    }
-
     async function searchScope(
       scope: ScopedMemoryTarget,
       query: string,
       limit: number,
     ): Promise<MemorySearchResult[]> {
-      const distanceThreshold = cfg.minScore !== undefined ? 1 - cfg.minScore : undefined;
-      const results = await client.searchLongTermMemory({
+      const results = await provider.searchLongTerm({
         text: query,
         limit,
-        namespace: scope.namespace ? { eq: scope.namespace } : undefined,
-        userId: scope.userId ? { eq: scope.userId } : undefined,
-        distanceThreshold,
+        namespace: scope.namespace,
+        userId: scope.userId,
+        minScore: cfg.minScore,
       });
 
-      return results.memories
-        .map((memory) => ({
-          id: memory.id,
-          text: memory.text,
-          score: Math.max(0, 1 - (memory.dist ?? 0)),
-          topics: memory.topics ?? undefined,
-          entities: memory.entities ?? undefined,
-          scope: scope.key,
-          scopeLabel: scope.label,
-        }))
-        .filter((memory) => memory.score >= (cfg.minScore ?? 0.3));
+      return results.map((result) => ({
+        id: result.id,
+        text: result.text,
+        // Pass the provider's score through unchanged: a real number for
+        // score-bearing backends (AMS), undefined for scoreless ones (RAM).
+        // Never coerce to 0 — that would fabricate a "0%" match.
+        score: result.score,
+        topics: result.topics,
+        entities: result.entities,
+        scope: scope.key,
+        scopeLabel: scope.label,
+      }));
     }
 
     function resolveSelectedScope(
@@ -352,40 +347,6 @@ const redisMemoryPlugin: PluginDefinition = {
         throw new Error(`Scope "${scopeKey}" is not available for this agent`);
       }
       return scope;
-    }
-
-    function buildLongTermMemoryStrategy(scope: ScopedMemoryTarget) {
-      if (!scope.extractionStrategy) return undefined;
-      return {
-        strategy: scope.extractionStrategy,
-        config:
-          scope.extractionStrategy === "custom" && scope.customPrompt
-            ? { prompt: scope.customPrompt }
-            : {},
-      };
-    }
-
-    async function refreshSummaryView(scope: ScopedMemoryTarget) {
-      const viewId = summaryViewIds.get(scope.key);
-      if (!viewId) return;
-
-      try {
-        const task = await client.runSummaryView(viewId);
-        api.logger.debug?.(
-          `redis-memory: triggered summary refresh for scope "${scope.key}" (task: ${task.id})`,
-        );
-      } catch (refreshErr) {
-        if (refreshErr instanceof MemoryNotFoundError) {
-          api.logger.info?.(
-            `redis-memory: summary view missing for scope "${scope.key}", re-creating...`,
-          );
-          await ensureSummaryView(scope);
-        } else {
-          api.logger.debug?.(
-            `redis-memory: summary refresh trigger failed for scope "${scope.key}": ${String(refreshErr)}`,
-          );
-        }
-      }
     }
 
     // ========================================================================
@@ -437,10 +398,20 @@ const redisMemoryPlugin: PluginDefinition = {
                 })),
               );
 
-              const merged = scopedResults
-                .flatMap((entry) => entry.memories)
-                .sort((left, right) => right.score - left.score)
-                .slice(0, limit);
+              // Scoreless providers (RAM) return no per-result score: the
+              // server-side similarityThreshold already ranked and filtered
+              // the hits, so preserve server order within each scope and
+              // concatenate scopes in plan order (flatMap yields plan order),
+              // then apply the limit. Only score-bearing providers (AMS)
+              // re-sort by score descending.
+              const flattened = scopedResults.flatMap((entry) => entry.memories);
+              const merged = (
+                showScores
+                  ? flattened.sort(
+                      (left, right) => (right.score ?? 0) - (left.score ?? 0),
+                    )
+                  : flattened
+              ).slice(0, limit);
 
               if (merged.length === 0) {
                 return {
@@ -455,7 +426,14 @@ const redisMemoryPlugin: PluginDefinition = {
                     targetScopes.length > 1
                       ? `[${memory.scopeLabel ?? memory.scope}] `
                       : "";
-                  return `${index + 1}. ${prefix}${memory.text} (${(memory.score * 100).toFixed(0)}%)`;
+                  // Show the "(NN%)" suffix only for score-bearing backends.
+                  // Scoreless providers render just the numbered memory text
+                  // (with the scope prefix when multi-scope).
+                  const scoreSuffix =
+                    showScores && typeof memory.score === "number"
+                      ? ` (${(memory.score * 100).toFixed(0)}%)`
+                      : "";
+                  return `${index + 1}. ${prefix}${memory.text}${scoreSuffix}`;
                 })
                 .join("\n");
 
@@ -528,45 +506,37 @@ const redisMemoryPlugin: PluginDefinition = {
                 plan.defaultStoreScope,
               );
               const inferredCategory = category ?? detectCategory(text);
-              const existing = await client.searchLongTermMemory({
+              const dup = await provider.findDuplicate({
                 text,
-                limit: 1,
-                namespace: targetScope.namespace ? { eq: targetScope.namespace } : undefined,
-                userId: targetScope.userId ? { eq: targetScope.userId } : undefined,
+                namespace: targetScope.namespace,
+                userId: targetScope.userId,
               });
 
-              if (existing.memories.length > 0 && existing.memories[0].dist < 0.05) {
+              if (dup) {
                 return {
                   content: [
                     {
                       type: "text",
                       text:
                         `Similar memory already exists in ${targetScope.label}: ` +
-                        `"${existing.memories[0].text}"`,
+                        `"${dup.text}"`,
                     },
                   ],
                   details: {
                     action: "duplicate",
                     scope: targetScope.key,
-                    existingId: existing.memories[0].id,
-                    existingText: existing.memories[0].text,
+                    existingId: dup.id,
+                    existingText: dup.text,
                   },
                 };
               }
 
-              const memoryId = randomUUID();
-              await client.createLongTermMemory(
-                [
-                  {
-                    id: memoryId,
-                    text,
-                    topics: [inferredCategory],
-                    namespace: targetScope.namespace,
-                    ...(targetScope.userId ? { user_id: targetScope.userId } : {}),
-                  },
-                ],
-                { namespace: targetScope.namespace },
-              );
+              const { id: memoryId } = await provider.createLongTerm({
+                text,
+                topics: [inferredCategory],
+                namespace: targetScope.namespace,
+                userId: targetScope.userId,
+              });
 
               return {
                 content: [
@@ -632,7 +602,7 @@ const redisMemoryPlugin: PluginDefinition = {
                 let lastError: unknown;
                 for (const scope of targetScopes) {
                   try {
-                    await client.deleteLongTermMemories([memoryId], {
+                    await provider.deleteLongTerm([memoryId], {
                       namespace: scope.namespace,
                     });
                     return {
@@ -653,13 +623,20 @@ const redisMemoryPlugin: PluginDefinition = {
               }
 
               if (query) {
-                const merged = (
+                const flattened = (
                   await Promise.all(
                     targetScopes.map((scope) => searchScope(scope, query, 5)),
                   )
-                )
-                  .flat()
-                  .sort((left, right) => right.score - left.score);
+                ).flat();
+                // Same scoreless stable-order rule as memory_recall: never
+                // sort by score for scoreless providers — a NaN comparator
+                // from undefined scores would corrupt order. Server order
+                // (already ranked by similarityThreshold) is preserved.
+                const merged = showScores
+                  ? flattened.sort(
+                      (left, right) => (right.score ?? 0) - (left.score ?? 0),
+                    )
+                  : flattened;
 
                 if (merged.length === 0) {
                   return {
@@ -668,11 +645,18 @@ const redisMemoryPlugin: PluginDefinition = {
                   };
                 }
 
-                if (merged.length === 1 && merged[0].score > 0.9) {
+                // For scoreless providers (RAM) the server-side
+                // similarityThreshold already ran, so "exactly one hit" IS the
+                // high-confidence signal. Score-bearing providers (AMS) keep
+                // the >0.9 gate to avoid auto-deleting a weak single match.
+                if (
+                  merged.length === 1 &&
+                  (!showScores || (merged[0].score ?? 0) > 0.9)
+                ) {
                   const winningScope = targetScopes.find(
                     (scope) => scope.key === merged[0].scope,
                   ) ?? plan.defaultStoreScope;
-                  await client.deleteLongTermMemories([merged[0].id], {
+                  await provider.deleteLongTerm([merged[0].id], {
                     namespace: winningScope.namespace,
                   });
                   return {
@@ -753,16 +737,12 @@ const redisMemoryPlugin: PluginDefinition = {
           const workingMemorySessionId = getWorkingMemorySessionId(sessionKey, scope);
           const trackingKey = buildTrackingKey(scope, workingMemorySessionId);
           try {
-            const workingMemory = await client.getWorkingMemory(workingMemorySessionId, {
+            const checkpoint = await provider.getCaptureCheckpoint(workingMemorySessionId, {
               namespace: scope.namespace,
+              userId: scope.userId,
             });
-            if (workingMemory?.messages && workingMemory.messages.length > 0) {
-              const maxTs = Math.max(
-                ...workingMemory.messages.map((message) =>
-                  message.created_at ? new Date(message.created_at).getTime() : 0,
-                ),
-              );
-              sessionMaxTimestamps.set(trackingKey, maxTs);
+            if (checkpoint > 0) {
+              sessionMaxTimestamps.set(trackingKey, checkpoint);
             } else {
               sessionMaxTimestamps.delete(trackingKey);
             }
@@ -777,49 +757,15 @@ const redisMemoryPlugin: PluginDefinition = {
         for (const scope of plan.recallScopes) {
           const scopedContextParts: string[] = [];
 
-          const viewId = summaryViewIds.get(scope.key) ?? (await ensureSummaryView(scope));
-          if (viewId) {
-            try {
-              const partitions = await client.listSummaryViewPartitions(viewId, {
-                namespace: scope.namespace,
-                userId: scope.userId,
-              });
-
-              const partition =
-                partitions.find((partition) => {
-                  for (const field of scope.summaryGroupBy) {
-                    if (field === "user_id" && partition.group.user_id !== scope.userId) {
-                      return false;
-                    }
-                    if (
-                      field === "namespace" &&
-                      partition.group.namespace !== scope.namespace
-                    ) {
-                      return false;
-                    }
-                  }
-                  return true;
-                }) ?? partitions[0];
-
-              if (partition?.summary && partition.memory_count > 0) {
-                scopedContextParts.push(
-                  `<user-summary computed="${partition.computed_at ?? "unknown"}" memories="${partition.memory_count}">\n${partition.summary}\n</user-summary>`,
-                );
-                api.logger.info?.(
-                  `redis-memory: injecting summary for scope "${scope.key}" (${partition.memory_count} memories)`,
-                );
-              }
-            } catch (err) {
-              if (err instanceof MemoryNotFoundError) {
-                api.logger.info?.(
-                  `redis-memory: summary view missing for scope "${scope.key}", re-creating...`,
-                );
-                await ensureSummaryView(scope);
-              } else {
-                api.logger.debug?.(
-                  `redis-memory: summary view fetch failed for scope "${scope.key}": ${String(err)}`,
-                );
-              }
+          if (provider.capabilities.summaryViews && provider.summaries) {
+            const part = await provider.summaries.getSummaryPartition(scope);
+            if (part) {
+              scopedContextParts.push(
+                `<user-summary computed="${part.computedAt ?? "unknown"}" memories="${part.memoryCount}">\n${part.summary}\n</user-summary>`,
+              );
+              api.logger.info?.(
+                `redis-memory: injecting summary for scope "${scope.key}" (${part.memoryCount} memories)`,
+              );
             }
           }
 
@@ -886,10 +832,9 @@ const redisMemoryPlugin: PluginDefinition = {
             const workingMemorySessionId = getWorkingMemorySessionId(sessionKey, scope);
             const trackingKey = buildTrackingKey(scope, workingMemorySessionId);
             const cutoffTs = sessionMaxTimestamps.get(trackingKey) ?? 0;
-            const newMessages = allMemoryMessages.filter((message) => {
-              const messageTs = message.created_at ? new Date(message.created_at).getTime() : 0;
-              return messageTs > cutoffTs;
-            });
+            const newMessages = allMemoryMessages.filter(
+              (message) => message.timestampMs > cutoffTs,
+            );
 
             sessionMaxTimestamps.delete(trackingKey);
 
@@ -897,14 +842,16 @@ const redisMemoryPlugin: PluginDefinition = {
               continue;
             }
 
-            await client.putWorkingMemory(workingMemorySessionId, {
-              messages: newMessages,
+            await provider.captureMessages(workingMemorySessionId, newMessages, {
               namespace: scope.namespace,
-              ...(scope.userId ? { user_id: scope.userId } : {}),
-              long_term_memory_strategy: buildLongTermMemoryStrategy(scope),
+              userId: scope.userId,
+              extractionStrategy: scope.extractionStrategy,
+              customPrompt: scope.customPrompt,
             });
 
-            await refreshSummaryView(scope);
+            if (provider.capabilities.summaryViews) {
+              await provider.summaries?.refreshView(scope);
+            }
           }
         } catch (err) {
           api.logger.warn(`redis-memory: capture failed: ${String(err)}`);
@@ -920,13 +867,15 @@ const redisMemoryPlugin: PluginDefinition = {
       id: "redis-memory",
       start: async () => {
         try {
-          await client.healthCheck();
+          await provider.healthCheck();
           api.logger.info?.(
             `redis-memory: connected to server (${cfg.serverUrl}, namespace: ${cfg.namespace ?? "default"})`,
           );
 
-          for (const scope of getConfiguredScopes(cfg)) {
-            await ensureSummaryView(scope);
+          if (provider.capabilities.summaryViews) {
+            for (const scope of getConfiguredScopes(cfg)) {
+              await provider.summaries?.ensureView(scope);
+            }
           }
         } catch (err) {
           api.logger.warn(

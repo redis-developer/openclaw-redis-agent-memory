@@ -17,6 +17,15 @@ export type MemoryStrategy = "discrete" | "summary" | "preferences" | "custom";
  */
 export type SummaryGroupByField = "user_id" | "namespace";
 
+/**
+ * Resolved backend provider for a parsed `MemoryConfig`.
+ *
+ * - "cloud": Redis Agent Memory (RAM), the managed cloud service. Default
+ *   for new installs.
+ * - "self-hosted": the open-source agent-memory-server (AMS).
+ */
+export type MemoryProviderKind = "cloud" | "self-hosted";
+
 export type MemoryScopeConfig = {
   label?: string;
   namespace?: string;
@@ -38,12 +47,34 @@ export type AgentMemoryRoute = {
 };
 
 export type MemoryConfig = {
-  /** Base URL of the agent-memory-server (e.g., 'http://localhost:8000') */
+  /**
+   * Resolved backend provider. Optional in input; always set (never
+   * undefined) once a config has been parsed. "cloud" (Redis Agent Memory)
+   * is the default backend; "self-hosted" (agent-memory-server) is resolved
+   * for legacy configs and when explicitly requested. See
+   * `parseMemoryConfig` for the resolution algorithm.
+   */
+  provider: MemoryProviderKind;
+  /**
+   * Base URL of the backend. For provider "cloud" this is the RAM cloud
+   * endpoint (falls back to AGENT_MEMORY_ENDPOINT); for "self-hosted" this
+   * is the agent-memory-server URL (e.g., 'http://localhost:8000', the
+   * default when unset).
+   */
   serverUrl: string;
-  /** Optional API key for authentication */
+  /**
+   * API key for authentication. Required for provider "cloud" (sent as the
+   * RAM bearer token; falls back to AGENT_MEMORY_API_KEY). Optional for
+   * "self-hosted".
+   */
   apiKey?: string;
-  /** Optional bearer token for authentication */
+  /** Optional bearer token for authentication (self-hosted only) */
   bearerToken?: string;
+  /**
+   * RAM store id (cloud provider only). Supports `${VAR}` substitution like
+   * every other string field; falls back to AGENT_MEMORY_STORE_ID.
+   */
+  storeId?: string;
   /** Namespace for organizing memories (default: "default") */
   namespace?: string;
   /** User ID for memory isolation (default: "default") */
@@ -84,6 +115,15 @@ export type MemoryConfig = {
   scopes?: Record<string, MemoryScopeConfig>;
   /** Optional routing from OpenClaw agent id to named scopes */
   agentScopes?: Record<string, AgentMemoryRoute>;
+  /**
+   * Output-only. Cloud-incompatible options (`extractionStrategy`,
+   * `customPrompt`, `summaryViewName`, `summaryTimeWindowDays`,
+   * `summaryGroupBy`) the user explicitly set (top-level or inside any
+   * scope) that the cloud provider ignores. Always `[]` for self-hosted.
+   * Not a valid input key — an input config containing `cloudIgnoredOptions`
+   * is rejected as unknown.
+   */
+  cloudIgnoredOptions: string[];
 };
 
 export const DEFAULT_SERVER_URL = "http://localhost:8000";
@@ -249,9 +289,11 @@ function parseAgentMemoryRoute(key: string, value: unknown): AgentMemoryRoute {
 }
 
 const ALLOWED_CONFIG_KEYS = [
+  "provider",
   "serverUrl",
   "apiKey",
   "bearerToken",
+  "storeId",
   "namespace",
   "userId",
   "workingMemorySessionId",
@@ -274,15 +316,25 @@ const ALLOWED_CONFIG_KEYS = [
 
 const VALID_STRATEGIES = ["discrete", "summary", "preferences", "custom"] as const;
 
+/**
+ * Options the cloud provider (Redis Agent Memory) does not support. Setting
+ * these does not throw — they're recorded in `cloudIgnoredOptions` instead,
+ * since a config may be shared between providers.
+ */
+const CLOUD_IGNORED_OPTION_KEYS = [
+  "extractionStrategy",
+  "customPrompt",
+  "summaryViewName",
+  "summaryTimeWindowDays",
+  "summaryGroupBy",
+] as const;
+
 export function parseMemoryConfig(value: unknown): MemoryConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("memory config required");
   }
   const cfg = value as Record<string, unknown>;
   assertAllowedKeys(cfg, ALLOWED_CONFIG_KEYS, "memory config");
-
-  const serverUrl =
-    typeof cfg.serverUrl === "string" ? cfg.serverUrl : DEFAULT_SERVER_URL;
 
   // Validate extraction strategy
   let extractionStrategy: MemoryStrategy | undefined;
@@ -384,11 +436,114 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
     }
   }
 
+  // --- Provider resolution & RAM credential resolution (Story 04) ---
+  //
+  // `${VAR}` substitution always happens first (matching every other string
+  // field); environment fallbacks for the cloud provider are applied only
+  // afterward, and only for fields the user left unset entirely.
+  const rawServerUrlPresent = typeof cfg.serverUrl === "string";
+  const rawServerUrl = rawServerUrlPresent
+    ? resolveEnvVars(cfg.serverUrl as string)
+    : undefined;
+  const rawApiKey = typeof cfg.apiKey === "string" ? resolveEnvVars(cfg.apiKey) : undefined;
+  const rawBearerToken =
+    typeof cfg.bearerToken === "string" ? resolveEnvVars(cfg.bearerToken) : undefined;
+  const storeIdInConfig = typeof cfg.storeId === "string";
+  const rawStoreId = storeIdInConfig ? resolveEnvVars(cfg.storeId as string) : undefined;
+
+  let provider: MemoryProviderKind;
+  if (cfg.provider === "cloud" || cfg.provider === "self-hosted") {
+    provider = cfg.provider;
+  } else if (cfg.provider !== undefined) {
+    throw new Error(
+      `Invalid provider: ${String(cfg.provider)}. Must be one of: cloud, self-hosted`,
+    );
+  } else if (
+    rawServerUrlPresent &&
+    !storeIdInConfig &&
+    !process.env.AGENT_MEMORY_STORE_ID
+  ) {
+    // Backwards-compat clause: an existing AMS-shaped config (serverUrl set,
+    // nothing RAM-shaped) keeps resolving to self-hosted without requiring
+    // an explicit "provider" key. Story 05 logs an informational note about
+    // this resolution when the plugin registers; parse time stays silent so
+    // config parsing has no side effects.
+    provider = "self-hosted";
+  } else {
+    provider = "cloud";
+  }
+
+  let serverUrl: string;
+  let apiKey: string | undefined;
+  let storeId: string | undefined;
+  if (provider === "cloud") {
+    serverUrl = rawServerUrl ?? process.env.AGENT_MEMORY_ENDPOINT ?? "";
+    apiKey = rawApiKey ?? process.env.AGENT_MEMORY_API_KEY ?? undefined;
+    storeId = rawStoreId ?? process.env.AGENT_MEMORY_STORE_ID ?? undefined;
+
+    if (rawBearerToken) {
+      throw new Error(
+        'bearerToken is not supported with the cloud provider (Redis Agent Memory). Set "apiKey" instead.',
+      );
+    }
+
+    const missing: string[] = [];
+    if (!serverUrl) missing.push("serverUrl (set it or AGENT_MEMORY_ENDPOINT)");
+    if (!apiKey) missing.push("apiKey (set it or AGENT_MEMORY_API_KEY)");
+    if (!storeId) missing.push("storeId (set it or AGENT_MEMORY_STORE_ID)");
+    if (missing.length > 0) {
+      throw new Error(
+        "Redis Agent Memory (cloud) is the default backend and requires serverUrl, apiKey, storeId.\n" +
+          `Missing: ${missing.join(", ")}.\n` +
+          'To use a self-hosted agent-memory-server instead, set "provider": "self-hosted".',
+      );
+    }
+  } else {
+    serverUrl = rawServerUrl ?? DEFAULT_SERVER_URL;
+    apiKey = rawApiKey;
+    storeId = rawStoreId;
+  }
+
+  // Cloud-incompatible options are never fatal — they may be shared configs
+  // toggled between providers. Record which the user explicitly set (either
+  // top-level or inside any scope) so Story 05 can log one consolidated
+  // warning at registration. Defaulting behavior for these options is
+  // unchanged regardless of provider.
+  let cloudIgnoredOptions: string[] = [];
+  if (provider === "cloud") {
+    const ignored = new Set<string>();
+    const rawScopes =
+      cfg.scopes && typeof cfg.scopes === "object" && !Array.isArray(cfg.scopes)
+        ? (cfg.scopes as Record<string, unknown>)
+        : undefined;
+
+    for (const key of CLOUD_IGNORED_OPTION_KEYS) {
+      let explicitlySet = cfg[key] !== undefined;
+      if (!explicitlySet && rawScopes) {
+        for (const scopeValue of Object.values(rawScopes)) {
+          if (
+            scopeValue &&
+            typeof scopeValue === "object" &&
+            !Array.isArray(scopeValue) &&
+            (scopeValue as Record<string, unknown>)[key] !== undefined
+          ) {
+            explicitlySet = true;
+            break;
+          }
+        }
+      }
+      if (explicitlySet) ignored.add(key);
+    }
+
+    cloudIgnoredOptions = Array.from(ignored);
+  }
+
   return {
-    serverUrl: resolveEnvVars(serverUrl),
-    apiKey: typeof cfg.apiKey === "string" ? resolveEnvVars(cfg.apiKey) : undefined,
-    bearerToken:
-      typeof cfg.bearerToken === "string" ? resolveEnvVars(cfg.bearerToken) : undefined,
+    provider,
+    serverUrl,
+    apiKey,
+    bearerToken: rawBearerToken,
+    storeId,
     namespace: parsedNamespace,
     // Default to undefined - only pass user_id when explicitly set
     // (client library v0.3.x doesn't pass user_id on GET, causing key mismatch)
@@ -427,6 +582,7 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
         : DEFAULT_FORGET_DESCRIPTION,
     scopes,
     agentScopes,
+    cloudIgnoredOptions,
   };
 }
 
@@ -436,23 +592,36 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
 export const memoryConfigSchema = {
   parse: parseMemoryConfig,
   uiHints: {
+    provider: {
+      label: "Backend",
+      help: 'Which backend to use. Defaults to "cloud" (Redis Agent Memory) unless an existing self-hosted config is detected.',
+      options: [
+        { value: "cloud", label: "Redis Agent Memory (cloud, default)" },
+        { value: "self-hosted", label: "Self-hosted agent-memory-server" },
+      ],
+    },
     serverUrl: {
       label: "Server URL",
       placeholder: DEFAULT_SERVER_URL,
-      help: "Base URL of the agent-memory-server (or use ${AGENT_MEMORY_SERVER_URL})",
+      help: "Base URL of the backend: the Redis Agent Memory cloud endpoint (falls back to ${AGENT_MEMORY_ENDPOINT}) when using the cloud provider, or the self-hosted agent-memory-server URL otherwise.",
     },
     apiKey: {
       label: "API Key",
       sensitive: true,
       placeholder: "your-api-key",
-      help: "API key for authentication (optional, or use ${AGENT_MEMORY_API_KEY})",
+      help: "API key for authentication. Required for the cloud provider (sent as the Redis Agent Memory bearer token; falls back to ${AGENT_MEMORY_API_KEY}). Optional for self-hosted.",
     },
     bearerToken: {
       label: "Bearer Token",
       sensitive: true,
       placeholder: "your-bearer-token",
-      help: "Bearer token for authentication (optional)",
+      help: "Bearer token for authentication (self-hosted only; optional). Not supported with the cloud provider — use API Key instead.",
       advanced: true,
+    },
+    storeId: {
+      label: "Store ID",
+      placeholder: "your-store-id",
+      help: "Redis Agent Memory store id (cloud provider only, or use ${AGENT_MEMORY_STORE_ID})",
     },
     namespace: {
       label: "Namespace",

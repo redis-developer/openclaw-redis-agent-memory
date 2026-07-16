@@ -13,6 +13,7 @@ import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { convertToMemoryMessages, readSessionIdFromStore } from "./index.js";
 import { resolveAgentScopePlan, parseAgentIdFromSessionKey } from "./scopes.js";
+import type { MemoryProvider, ProviderCapabilities } from "./provider.js";
 
 const MEMORY_SERVER_URL = process.env.AGENT_MEMORY_SERVER_URL ?? "http://localhost:8000";
 const MEMORY_SERVER_API_KEY = process.env.AGENT_MEMORY_API_KEY;
@@ -20,6 +21,39 @@ const MEMORY_SERVER_BEARER_TOKEN = process.env.AGENT_MEMORY_BEARER_TOKEN;
 const HAS_SERVER = Boolean(process.env.AGENT_MEMORY_SERVER_URL);
 const liveEnabled = HAS_SERVER && process.env.OPENCLAW_LIVE_TEST === "1";
 const describeLive = liveEnabled ? describe : describe.skip;
+
+// Env isolation (Story 04): the config-parsing tests below pass an explicit
+// serverUrl (resolving provider "self-hosted"), but ambient
+// AGENT_MEMORY_STORE_ID/ENDPOINT/API_KEY in the developer's shell could
+// otherwise flip provider resolution to "cloud" (see parseMemoryConfig's
+// backwards-compat clause) and break them. Clear these three for every
+// test in this file and restore them afterward. This does not touch
+// AGENT_MEMORY_SERVER_URL/OPENCLAW_LIVE_TEST, which are read once above at
+// import time (before this hook ever runs) to gate describeLive.
+const CLOUD_ENV_KEYS = [
+  "AGENT_MEMORY_ENDPOINT",
+  "AGENT_MEMORY_API_KEY",
+  "AGENT_MEMORY_STORE_ID",
+] as const;
+let savedCloudEnv: Record<string, string | undefined> = {};
+
+beforeEach(() => {
+  savedCloudEnv = {};
+  for (const key of CLOUD_ENV_KEYS) {
+    savedCloudEnv[key] = process.env[key];
+    delete process.env[key];
+  }
+});
+
+afterEach(() => {
+  for (const key of CLOUD_ENV_KEYS) {
+    if (savedCloudEnv[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = savedCloudEnv[key];
+    }
+  }
+});
 
 describe("redis-memory plugin", () => {
   test("memory plugin registers and initializes correctly", async () => {
@@ -64,7 +98,13 @@ describe("redis-memory plugin", () => {
   test("config schema uses defaults when not provided", async () => {
     const { default: memoryPlugin } = await import("./index.js");
 
-    const config = memoryPlugin.configSchema?.parse?.({});
+    // Cloud is now the default provider, which requires serverUrl/apiKey/
+    // storeId (see Story 04). Passing serverUrl explicitly (and nothing
+    // RAM-shaped) resolves provider "self-hosted" via the backwards-compat
+    // clause, exercising the same defaults this test has always covered.
+    const config = memoryPlugin.configSchema?.parse?.({
+      serverUrl: "http://localhost:8000",
+    });
 
     expect(config?.serverUrl).toBe("http://localhost:8000");
     expect(config?.timeout).toBe(30000);
@@ -222,7 +262,9 @@ describe("convertToMemoryMessages", () => {
 
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("msg-1");
-    expect(result[0].created_at).toBe(new Date(timestamp).toISOString());
+    // convertToMemoryMessages now returns the neutral CapturedMessage shape
+    // (numeric timestampMs) instead of the AMS-specific created_at ISO string.
+    expect(result[0].timestampMs).toBe(timestamp);
   });
 
   test("falls back to current time when timestamp not provided", () => {
@@ -235,7 +277,7 @@ describe("convertToMemoryMessages", () => {
     const after = Date.now();
 
     expect(result).toHaveLength(1);
-    const resultTs = new Date(result[0].created_at!).getTime();
+    const resultTs = result[0].timestampMs;
     expect(resultTs).toBeGreaterThanOrEqual(before);
     expect(resultTs).toBeLessThanOrEqual(after);
   });
@@ -476,6 +518,383 @@ describe("timestamp-based message filtering", () => {
     // Message without timestamp gets 0, which is < cutoffTs, so filtered out
     expect(newMessages).toHaveLength(1);
     expect(newMessages[0].id).toBe("2");
+  });
+});
+
+// ============================================================================
+// Story 05: provider integration & capability gating (mocked, fully offline)
+// ============================================================================
+//
+// These tests exercise register()'s provider wiring without any network by
+// mocking ./providers/factory.js so createProvider returns a fake
+// MemoryProvider whose capabilities and method behaviors the test controls.
+// A couple of tests use the REAL factory (registration only, which makes no
+// network calls) to verify the backend-aware registration log and warning.
+
+type CapturedLogs = {
+  info: string[];
+  warn: string[];
+  error: string[];
+  debug: string[];
+  all: string[];
+};
+
+type FakeApiHarness = {
+  api: any;
+  tools: Array<{ tool: any; opts: any }>;
+  hooks: Record<string, any[]>;
+  services: any[];
+  logs: CapturedLogs;
+};
+
+/** Reusable fake PluginApi that captures tools, hooks, services, and logs. */
+function createFakeApi(pluginConfig: Record<string, unknown>): FakeApiHarness {
+  const tools: Array<{ tool: any; opts: any }> = [];
+  const hooks: Record<string, any[]> = {};
+  const services: any[] = [];
+  const logs: CapturedLogs = { info: [], warn: [], error: [], debug: [], all: [] };
+  const record = (level: "info" | "warn" | "error" | "debug", msg: string) => {
+    logs[level].push(msg);
+    logs.all.push(`[${level}] ${msg}`);
+  };
+  const api = {
+    id: "redis-memory",
+    name: "Redis Memory",
+    source: "test",
+    config: {},
+    pluginConfig,
+    runtime: {},
+    logger: {
+      info: (m: string) => record("info", m),
+      warn: (m: string) => record("warn", m),
+      error: (m: string) => record("error", m),
+      debug: (m: string) => record("debug", m),
+    },
+    registerTool: (tool: any, opts: any) => tools.push({ tool, opts }),
+    registerService: (service: any) => services.push(service),
+    on: (name: string, handler: any) => {
+      (hooks[name] ??= []).push(handler);
+    },
+    resolvePath: (p: string) => p,
+  };
+  return { api, tools, hooks, services, logs };
+}
+
+/** Build a fake MemoryProvider; every method defaults to a no-op vi.fn(). */
+function createFakeProvider(
+  overrides: Omit<Partial<MemoryProvider>, "capabilities"> & {
+    capabilities?: Partial<ProviderCapabilities>;
+  } = {},
+): MemoryProvider {
+  const capabilities: ProviderCapabilities = {
+    summaryViews: false,
+    extractionStrategy: false,
+    similarityScores: false,
+    ...overrides.capabilities,
+  };
+  return {
+    capabilities,
+    healthCheck: overrides.healthCheck ?? vi.fn(async () => {}),
+    searchLongTerm: overrides.searchLongTerm ?? vi.fn(async () => []),
+    createLongTerm: overrides.createLongTerm ?? vi.fn(async () => ({ id: "created-id" })),
+    deleteLongTerm: overrides.deleteLongTerm ?? vi.fn(async () => {}),
+    findDuplicate: overrides.findDuplicate ?? vi.fn(async () => null),
+    getCaptureCheckpoint: overrides.getCaptureCheckpoint ?? vi.fn(async () => 0),
+    captureMessages: overrides.captureMessages ?? vi.fn(async () => {}),
+    summaries: overrides.summaries,
+  };
+}
+
+/** Register the plugin with ./providers/factory.js mocked to return `provider`. */
+async function registerWithFakeProvider(
+  pluginConfig: Record<string, unknown>,
+  provider: MemoryProvider,
+): Promise<FakeApiHarness & { createProvider: ReturnType<typeof vi.fn> }> {
+  const createProvider = vi.fn(() => provider);
+  vi.resetModules();
+  vi.doMock("./providers/factory.js", () => ({ createProvider }));
+  const { default: plugin } = await import("./index.js");
+  const harness = createFakeApi(pluginConfig);
+  await plugin.register(harness.api);
+  return { ...harness, createProvider };
+}
+
+/** Register the plugin with the REAL factory (registration makes no network calls). */
+async function registerWithRealProvider(
+  pluginConfig: Record<string, unknown>,
+): Promise<FakeApiHarness> {
+  vi.resetModules();
+  vi.doUnmock("./providers/factory.js");
+  const { default: plugin } = await import("./index.js");
+  const harness = createFakeApi(pluginConfig);
+  await plugin.register(harness.api);
+  return harness;
+}
+
+function buildTool(
+  tools: Array<{ tool: any; opts: any }>,
+  name: string,
+  ctx: Record<string, unknown> = {},
+) {
+  const entry = tools.find((t) => t.opts?.name === name)?.tool;
+  return typeof entry === "function" ? entry(ctx) : entry;
+}
+
+const SELF_HOSTED_CONFIG = { serverUrl: "http://localhost:8000", namespace: "test" };
+const TOOL_CTX = { agentId: "main", sessionKey: "agent:main:main" };
+
+describe("redis-memory plugin — provider integration (Story 05)", () => {
+  afterEach(() => {
+    // Undo any per-test module mocks so later tests (including describeLive)
+    // get the real modules.
+    vi.doUnmock("./providers/factory.js");
+    vi.doUnmock("./providers/ams.js");
+    vi.doUnmock("./providers/ram.js");
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  test("factory routes provider 'cloud' → RAM and 'self-hosted' → AMS", async () => {
+    vi.resetModules();
+    const createAmsProvider = vi.fn(() => ({ __kind: "ams" }));
+    const createRamProvider = vi.fn(() => ({ __kind: "ram" }));
+    vi.doMock("./providers/ams.js", () => ({ createAmsProvider }));
+    vi.doMock("./providers/ram.js", () => ({ createRamProvider }));
+
+    const { createProvider } = await import("./providers/factory.js");
+
+    const ram = createProvider({ provider: "cloud" } as any);
+    expect(createRamProvider).toHaveBeenCalledTimes(1);
+    expect(ram).toEqual({ __kind: "ram" });
+
+    const ams = createProvider({ provider: "self-hosted" } as any);
+    expect(createAmsProvider).toHaveBeenCalledTimes(1);
+    expect(ams).toEqual({ __kind: "ams" });
+  });
+
+  test("cloud-resolved config logs 'backend: cloud' with storeId and never leaks apiKey", async () => {
+    process.env.AGENT_MEMORY_ENDPOINT = "https://ram.example.com/memory";
+    process.env.AGENT_MEMORY_API_KEY = "super-secret-key";
+    process.env.AGENT_MEMORY_STORE_ID = "store-xyz";
+
+    const { logs } = await registerWithRealProvider({});
+
+    const line = logs.info.find((l) => l.includes("backend: cloud"));
+    expect(line).toBeDefined();
+    expect(line).toContain("storeId: store-xyz");
+    expect(line).toContain("https://ram.example.com/memory");
+    expect(line).toContain("namespace: default");
+    // apiKey must never appear in any log line.
+    expect(logs.all.join("\n")).not.toContain("super-secret-key");
+  });
+
+  test("self-hosted config logs 'backend: self-hosted' (no storeId)", async () => {
+    const provider = createFakeProvider({
+      capabilities: { summaryViews: true, extractionStrategy: true, similarityScores: true },
+    });
+    const { logs } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+
+    const line = logs.info.find((l) => l.includes("backend: self-hosted"));
+    expect(line).toBeDefined();
+    expect(line).toContain("server: http://localhost:8000");
+    expect(line).not.toContain("storeId");
+  });
+
+  test("summaryViews=false: before_prompt_build makes no summary calls but still injects <relevant-memories>", async () => {
+    const searchLongTerm = vi.fn(async () => [
+      { id: "m1", text: "User loves hiking in the mountains", score: undefined, topics: ["preference"] },
+    ]);
+    const provider = createFakeProvider({
+      capabilities: { summaryViews: false, extractionStrategy: false, similarityScores: false },
+      searchLongTerm,
+      getCaptureCheckpoint: vi.fn(async () => 0),
+    });
+    // No `summaries` member — mirrors the RAM provider exactly.
+    expect(provider.summaries).toBeUndefined();
+
+    const { hooks } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+    const handler = hooks["before_prompt_build"]?.[0];
+    expect(handler).toBeDefined();
+
+    const result = await handler(
+      { prompt: "what activities do I enjoy" },
+      TOOL_CTX,
+    );
+
+    expect(searchLongTerm).toHaveBeenCalled();
+    expect(result?.prependContext).toContain("<relevant-memories");
+    expect(result?.prependContext).toContain("User loves hiking");
+    // No summary was fetched or injected.
+    expect(result?.prependContext).not.toContain("<user-summary>");
+  });
+
+  test("memory_recall: scoreless provider renders no percentages", async () => {
+    const provider = createFakeProvider({
+      capabilities: { similarityScores: false },
+      searchLongTerm: vi.fn(async () => [
+        { id: "1", text: "prefers tea over coffee", score: undefined },
+      ]),
+    });
+    const { tools } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+    const recall = buildTool(tools, "memory_recall", TOOL_CTX);
+
+    const res = await recall.execute("c1", { query: "beverage preference", limit: 5 });
+    const text = res.content[0].text;
+
+    expect(text).toContain("prefers tea over coffee");
+    expect(text).not.toContain("%");
+  });
+
+  test("memory_recall: scored provider keeps (NN%) suffix", async () => {
+    const provider = createFakeProvider({
+      capabilities: { similarityScores: true },
+      searchLongTerm: vi.fn(async () => [
+        { id: "1", text: "prefers tea over coffee", score: 0.87 },
+      ]),
+    });
+    const { tools } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+    const recall = buildTool(tools, "memory_recall", TOOL_CTX);
+
+    const res = await recall.execute("c1", { query: "beverage preference", limit: 5 });
+    const text = res.content[0].text;
+
+    expect(text).toContain("prefers tea over coffee");
+    expect(text).toContain("(87%)");
+  });
+
+  test("memory_store: duplicate path uses provider.findDuplicate for scored and scoreless providers", async () => {
+    for (const similarityScores of [true, false]) {
+      const findDuplicate = vi.fn(async () => ({ id: "dup-1", text: "existing memory text" }));
+      const provider = createFakeProvider({
+        capabilities: { similarityScores },
+        findDuplicate,
+      });
+      const { tools } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+      const store = buildTool(tools, "memory_store", TOOL_CTX);
+
+      const res = await store.execute("c1", { text: "some memory to store" });
+
+      expect(findDuplicate).toHaveBeenCalledTimes(1);
+      expect(res.details.action).toBe("duplicate");
+    }
+  });
+
+  test("memory_forget: scoreless single hit auto-deletes", async () => {
+    const deleteLongTerm = vi.fn(async () => {});
+    const provider = createFakeProvider({
+      capabilities: { similarityScores: false },
+      searchLongTerm: vi.fn(async () => [
+        { id: "m1", text: "old memory to remove", score: undefined },
+      ]),
+      deleteLongTerm,
+    });
+    const { tools } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+    const forget = buildTool(tools, "memory_forget", TOOL_CTX);
+
+    const res = await forget.execute("c1", { query: "old memory to remove" });
+
+    expect(res.details.action).toBe("deleted");
+    expect(res.details.id).toBe("m1");
+    expect(deleteLongTerm).toHaveBeenCalledTimes(1);
+    expect(deleteLongTerm).toHaveBeenCalledWith(["m1"], expect.anything());
+  });
+
+  test("memory_forget: scoreless multiple hits lists candidates without deleting", async () => {
+    const deleteLongTerm = vi.fn(async () => {});
+    const provider = createFakeProvider({
+      capabilities: { similarityScores: false },
+      searchLongTerm: vi.fn(async () => [
+        { id: "m1", text: "memory one", score: undefined },
+        { id: "m2", text: "memory two", score: undefined },
+      ]),
+      deleteLongTerm,
+    });
+    const { tools } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+    const forget = buildTool(tools, "memory_forget", TOOL_CTX);
+
+    const res = await forget.execute("c1", { query: "memory" });
+
+    expect(res.details.action).toBe("candidates");
+    expect(res.details.candidates).toHaveLength(2);
+    expect(deleteLongTerm).not.toHaveBeenCalled();
+  });
+
+  test("memory_forget: scored provider single high-confidence hit (>0.9) auto-deletes", async () => {
+    const deleteLongTerm = vi.fn(async () => {});
+    const provider = createFakeProvider({
+      capabilities: { similarityScores: true },
+      searchLongTerm: vi.fn(async () => [
+        { id: "m1", text: "old memory to remove", score: 0.95 },
+      ]),
+      deleteLongTerm,
+    });
+    const { tools } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+    const forget = buildTool(tools, "memory_forget", TOOL_CTX);
+
+    const res = await forget.execute("c1", { query: "old memory to remove" });
+
+    expect(res.details.action).toBe("deleted");
+    expect(res.details.id).toBe("m1");
+    expect(deleteLongTerm).toHaveBeenCalledTimes(1);
+    expect(deleteLongTerm).toHaveBeenCalledWith(["m1"], expect.anything());
+  });
+
+  test("memory_forget: scored provider single low-confidence hit (<=0.9) lists candidates without deleting", async () => {
+    const deleteLongTerm = vi.fn(async () => {});
+    const provider = createFakeProvider({
+      capabilities: { similarityScores: true },
+      searchLongTerm: vi.fn(async () => [
+        { id: "m1", text: "maybe this memory", score: 0.5 },
+      ]),
+      deleteLongTerm,
+    });
+    const { tools } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+    const forget = buildTool(tools, "memory_forget", TOOL_CTX);
+
+    const res = await forget.execute("c1", { query: "maybe this memory" });
+
+    // Exactly one hit, but below the 0.9 confidence threshold → do NOT auto-delete.
+    expect(res.details.action).toBe("candidates");
+    expect(res.details.candidates).toHaveLength(1);
+    expect(deleteLongTerm).not.toHaveBeenCalled();
+  });
+
+  test("cloud + ignored options logs exactly one warning at registration", async () => {
+    process.env.AGENT_MEMORY_ENDPOINT = "https://ram.example.com/memory";
+    process.env.AGENT_MEMORY_API_KEY = "super-secret-key";
+    process.env.AGENT_MEMORY_STORE_ID = "store-xyz";
+
+    const { logs } = await registerWithRealProvider({ extractionStrategy: "summary" });
+
+    expect(logs.warn).toHaveLength(1);
+    expect(logs.warn[0]).toContain("extractionStrategy");
+    expect(logs.warn[0]).toContain("ignored");
+  });
+
+  test("agent_end captures new messages via provider.captureMessages (no refreshView when summaryless)", async () => {
+    const captureMessages = vi.fn(async () => {});
+    const provider = createFakeProvider({
+      capabilities: { summaryViews: false, extractionStrategy: false, similarityScores: false },
+      captureMessages,
+      getCaptureCheckpoint: vi.fn(async () => 0),
+    });
+    const { hooks } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+    const handler = hooks["agent_end"]?.[0];
+    expect(handler).toBeDefined();
+
+    await handler(
+      {
+        success: true,
+        messages: [{ role: "user", content: "I love hiking", timestamp: 1000, id: "a" }],
+      },
+      TOOL_CTX,
+    );
+
+    expect(captureMessages).toHaveBeenCalledTimes(1);
+    const [, capturedMsgs] = captureMessages.mock.calls[0];
+    expect(capturedMsgs[0].content).toBe("I love hiking");
+    // summaryViews=false + no summaries member: no crash, no summary refresh.
+    expect(provider.summaries).toBeUndefined();
   });
 });
 

@@ -32,3 +32,35 @@ jobs:
       - name: Run tests
         run: npm test
 
+  integration-cloud:
+    runs-on: ubuntu-latest
+    # The cloud integration suite self-skips when the AGENT_MEMORY_* secrets are
+    # unset (e.g. on fork PRs, where secrets are empty), so this job is safe to
+    # run unconditionally — it just becomes a no-op that reports skipped tests.
+    # A single global concurrency group serializes runs so two PRs never
+    # interleave writes into the shared cloud store (Story 06's unique-namespace
+    # isolation is the primary defense; this is belt-and-braces).
+    concurrency:
+      group: ram-cloud-integration
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Cloud integration tests
+        env:
+          AGENT_MEMORY_ENDPOINT: ${{ secrets.AGENT_MEMORY_ENDPOINT }}
+          AGENT_MEMORY_API_KEY: ${{ secrets.AGENT_MEMORY_API_KEY }}
+          AGENT_MEMORY_STORE_ID: ${{ secrets.AGENT_MEMORY_STORE_ID }}
+        run: npm run test:integration
