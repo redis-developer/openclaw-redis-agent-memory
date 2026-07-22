@@ -32,3 +32,8 @@ yarn-error.log*
 # Test coverage
 coverage/
 
+# Local and CI test artifacts
+artifacts/
+
+# Local planning and review material
+specs/

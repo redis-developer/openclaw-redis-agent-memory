@@ -26,8 +26,11 @@
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:integration": "vitest run integration",
+    "test:integration:release": "node scripts/run-live-release.mjs",
+    "test:load": "npm run build && node scripts/run-bounded-load.mjs",
+    "test:package": "npm run build && node scripts/package-smoke.mjs",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run clean && npm run build"
+    "prepublishOnly": "npm run clean && npm run build && npm test && npm run test:package"
   },
   "openclaw": {
     "extensions": [
@@ -58,6 +61,7 @@
     "url": "https://github.com/redis-developer/openclaw-redis-agent-memory/issues"
   },
   "dependencies": {
+    "@redis-iris/agent-memory": "0.1.1",
     "@sinclair/typebox": "^0.34.0",
     "agent-memory-client": "^0.3.1"
   },

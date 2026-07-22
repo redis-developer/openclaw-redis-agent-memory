@@ -21,7 +21,7 @@
  * Vitest still *collects* (walks) the describe/nested-describe factory
  * bodies below to enumerate skipped tests for reporting, but it never
  * invokes a `test()`/`beforeAll()`/`afterAll()` *body* for a skipped suite.
- * Every `RamClient` construction, `createRamProvider()` call, and
+ * Every `RamSdkAdapter` construction, `createRamProvider()` call, and
  * `parseMemoryConfig()` call in this file lives strictly inside a
  * `test(...)` or `beforeAll(...)` callback body — never directly in a
  * `describe(...)` factory body and never at module top level — so a bare
@@ -56,19 +56,23 @@
  * ## Extraction timing
  *
  * RAM extracts long-term memories from session events asynchronously,
- * server-side, on a schedule this plugin does not control. The one test that
- * depends on extraction having happened
- * polls for up to 60s and calls `ctx.skip()` (not a failing assertion) if
- * nothing has materialized by the deadline, logging a loud `console.warn`
- * first. No other test in this file depends on extraction.
+ * server-side, on a schedule this plugin does not control. Developer runs
+ * retain a 60s observational deadline and may skip that one assertion. The
+ * protected release gate sets RAM_RELEASE_GATE=1, extends the deadline to
+ * 360s, and treats a timeout or any skipped live test as a hard failure. The
+ * longer release ceiling accommodates observed store-level scheduling when
+ * two extraction sessions are submitted back to back.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import type { LongTermMemoryFilter } from "@redis-iris/agent-memory/models";
 
-import { RamClient } from "./client.js";
-import { RamApiError, type RamLongTermMemoryFilter } from "./types.js";
-import { createRamProvider } from "../providers/ram.js";
+import { RamSdkAdapter } from "./adapter.js";
+import { RamApiError } from "./errors.js";
+import { createRamProvider, deriveRamOwnerId } from "../providers/ram.js";
 import { parseMemoryConfig } from "../config.js";
 import type { CapturedMessage } from "../provider.js";
 import memoryPlugin from "../index.js";
@@ -80,8 +84,27 @@ import memoryPlugin from "../index.js";
 const RAM_ENDPOINT = process.env.AGENT_MEMORY_ENDPOINT;
 const RAM_API_KEY = process.env.AGENT_MEMORY_API_KEY;
 const RAM_STORE_ID = process.env.AGENT_MEMORY_STORE_ID;
+const RELEASE_GATE = process.env.RAM_RELEASE_GATE === "1";
+const REQUIRED_RAM_ENV = [
+  "AGENT_MEMORY_ENDPOINT",
+  "AGENT_MEMORY_API_KEY",
+  "AGENT_MEMORY_STORE_ID",
+] as const;
 const ramLive = Boolean(RAM_ENDPOINT && RAM_API_KEY && RAM_STORE_ID);
+if (RELEASE_GATE && !ramLive) {
+  const missing = REQUIRED_RAM_ENV.filter((name) => !process.env[name]?.trim());
+  throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+}
 const describeRamLive = ramLive ? describe : describe.skip;
+const EXTRACTION_DEADLINE_MS = RELEASE_GATE ? 360_000 : 60_000;
+
+function writeReleaseArtifact(name: string, value: unknown): void {
+  if (!RELEASE_GATE) return;
+  const directory = process.env.RAM_RELEASE_RESULTS_DIR;
+  if (!directory || !/^[-A-Za-z0-9]+$/.test(name)) return;
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(resolve(directory, `${name}.json`), JSON.stringify(value, null, 2) + "\n");
+}
 
 // ============================================================================
 // Generic polling helper (used for eventual-consistency waits)
@@ -172,13 +195,18 @@ function buildTool(
 // ============================================================================
 
 describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)", () => {
-  let client: RamClient;
+  let client: RamSdkAdapter;
   let testNamespace: string;
   const allSessionIds = new Set<string>();
+  const cleanupDiagnostics = {
+    memoryDeleteBatches: 0,
+    sessionDeleteAttempts: 0,
+    failures: 0,
+  };
 
   beforeAll(() => {
     testNamespace = `oc-it-${randomUUID().slice(0, 8)}`;
-    client = new RamClient({
+    client = new RamSdkAdapter({
       serverUrl: RAM_ENDPOINT!,
       apiKey: RAM_API_KEY!,
       storeId: RAM_STORE_ID!,
@@ -197,9 +225,25 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
       const batch = unique.slice(i, i + 100);
       if (batch.length === 0) continue;
       try {
-        await client.bulkDeleteLongTermMemories(batch);
+        cleanupDiagnostics.memoryDeleteBatches += 1;
+        const response = await client.bulkDeleteLongTermMemories({ memoryIds: batch });
+        const deleted = new Set(response.deleted);
+        const unresolved = batch.filter((id) => !deleted.has(id));
+        if (RELEASE_GATE && unresolved.length > 0) {
+          const stillPresent = await Promise.all(unresolved.map(async (id) => {
+            try {
+              await client.getLongTermMemory(id);
+              return true;
+            } catch (error) {
+              if (error instanceof RamApiError && error.isNotFound) return false;
+              return true;
+            }
+          }));
+          cleanupDiagnostics.failures += stillPresent.filter(Boolean).length;
+        }
       } catch (err) {
         if (err instanceof RamApiError && err.isNotFound) continue;
+        cleanupDiagnostics.failures += 1;
         console.warn(
           `[integration cleanup] bulkDeleteLongTermMemories failed for [${batch.join(", ")}]: ${String(err)}`,
         );
@@ -207,7 +251,7 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
     }
   }
 
-  async function sweepByFilter(filter: RamLongTermMemoryFilter): Promise<void> {
+  async function sweepByFilter(filter: LongTermMemoryFilter): Promise<void> {
     const ids: string[] = [];
     let pageToken: string | undefined;
     let guard = 0;
@@ -216,13 +260,19 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
       try {
         res = await client.searchLongTermMemory({ filter, limit: 100, pageToken });
       } catch (err) {
+        cleanupDiagnostics.failures += 1;
         console.warn(`[integration cleanup] sweep search failed: ${String(err)}`);
         return;
       }
-      for (const memory of res.memories) ids.push(memory.id);
+      for (const memory of res.items) ids.push(memory.id);
       pageToken = res.nextPageToken;
       guard += 1;
     } while (pageToken && guard < 50);
+    if (pageToken) {
+      cleanupDiagnostics.failures += 1;
+      console.warn("[integration cleanup] sweep pagination limit reached");
+      return;
+    }
     if (ids.length > 0) {
       await bulkDeleteBatched(ids);
     }
@@ -233,10 +283,12 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
   }
 
   async function safeDeleteSession(sessionId: string): Promise<void> {
+    cleanupDiagnostics.sessionDeleteAttempts += 1;
     try {
       await client.deleteSessionMemory(sessionId);
     } catch (err) {
       if (err instanceof RamApiError && err.isNotFound) return;
+      cleanupDiagnostics.failures += 1;
       console.warn(
         `[integration cleanup] deleteSessionMemory("${sessionId}") failed: ${String(err)}`,
       );
@@ -253,6 +305,22 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
       await safeDeleteSession(sessionId);
     }
     allSessionIds.clear();
+    if (RELEASE_GATE) {
+      try {
+        const verification = await client.searchLongTermMemory({
+          filter: { namespace: { eq: testNamespace } },
+          limit: 1,
+        });
+        if (verification.items.length > 0) cleanupDiagnostics.failures += 1;
+      } catch {
+        cleanupDiagnostics.failures += 1;
+      }
+    }
+    writeReleaseArtifact(
+      `node${process.versions.node.split(".")[0]}-pass${process.env.RAM_RELEASE_RUN ?? "0"}-cleanup`,
+      cleanupDiagnostics,
+    );
+    if (RELEASE_GATE) expect(cleanupDiagnostics.failures).toBe(0);
   }, 30000);
 
   // ==========================================================================
@@ -277,7 +345,7 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
       const fixtureIds = [idFox, idRedis, idParis];
 
       beforeAll(async () => {
-        const created = await client.bulkCreateLongTermMemories([
+        const created = await client.bulkCreateLongTermMemories({ memories: [
           {
             id: idFox,
             text: "The quick brown fox jumps over the lazy dog.",
@@ -299,7 +367,7 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
             namespace: testNamespace,
             topics: ["geography"],
           },
-        ]);
+        ] });
         expect([...created.created].sort()).toEqual([...fixtureIds].sort());
       }, 20000);
 
@@ -317,11 +385,11 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
               filter: { namespace: { eq: testNamespace } },
               limit: 10,
             }),
-          (res) => res.memories.some((m) => m.id === idFox),
+          (res) => res.items.some((m) => m.id === idFox),
           { intervalMs: 1000, timeoutMs: 15000 },
         );
         expect(timedOut).toBe(false);
-        expect(value.memories.some((m) => m.id === idFox)).toBe(true);
+        expect(value.items.some((m) => m.id === idFox)).toBe(true);
       }, 20000);
 
       test("search with ownerId filter excludes other owners", async () => {
@@ -329,7 +397,7 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
           filter: { namespace: { eq: testNamespace }, ownerId: { eq: ownerA } },
           limit: 10,
         });
-        const ids = res.memories.map((m) => m.id);
+        const ids = res.items.map((m) => m.id);
         expect(ids).toContain(idFox);
         expect(ids).not.toContain(idRedis);
         expect(ids).not.toContain(idParis);
@@ -340,7 +408,7 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
           filter: { namespace: { eq: testNamespace }, topics: { in: ["databases"] } },
           limit: 10,
         });
-        const ids = res.memories.map((m) => m.id);
+        const ids = res.items.map((m) => m.id);
         expect(ids).toContain(idRedis);
         expect(ids).not.toContain(idFox);
         expect(ids).not.toContain(idParis);
@@ -353,7 +421,7 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
           filter: { namespace: { eq: testNamespace } },
           limit: 10,
         });
-        expect(res.memories).toHaveLength(0);
+        expect(res.items).toHaveLength(0);
       }, 20000);
 
       test("pagination with limit 1 walks all 3 records via nextPageToken", async () => {
@@ -366,8 +434,8 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
             limit: 1,
             pageToken,
           });
-          expect(res.memories.length).toBeLessThanOrEqual(1);
-          for (const memory of res.memories) seen.add(memory.id);
+          expect(res.items.length).toBeLessThanOrEqual(1);
+          for (const memory of res.items) seen.add(memory.id);
           pageToken = res.nextPageToken;
           pages += 1;
         } while (pageToken && pages < 10);
@@ -376,7 +444,7 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
       }, 30000);
 
       test("bulk delete removes the records and search confirms gone", async () => {
-        const res = await client.bulkDeleteLongTermMemories(fixtureIds);
+        const res = await client.bulkDeleteLongTermMemories({ memoryIds: fixtureIds });
         expect([...res.deleted].sort()).toEqual([...fixtureIds].sort());
 
         const { value, timedOut } = await poll(
@@ -385,11 +453,11 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
               filter: { namespace: { eq: testNamespace } },
               limit: 10,
             }),
-          (res2) => res2.memories.length === 0,
+          (res2) => res2.items.length === 0,
           { intervalMs: 1000, timeoutMs: 15000 },
         );
         expect(timedOut).toBe(false);
-        expect(value.memories).toHaveLength(0);
+        expect(value.items).toHaveLength(0);
       }, 30000);
     });
   });
@@ -429,7 +497,11 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
         expect(match?.text).toBe(text);
         expect(match?.score).toBeUndefined();
       } finally {
-        await provider.deleteLongTerm([id], { namespace: testNamespace });
+        await provider.deleteLongTerm([id], {
+          key: "default",
+          namespace: testNamespace,
+          userId: ownerId,
+        });
       }
     }, 25000);
 
@@ -460,7 +532,11 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
         });
         expect(noDup).toBeNull();
       } finally {
-        await provider.deleteLongTerm([id], { namespace: testNamespace });
+        await provider.deleteLongTerm([id], {
+          key: "default",
+          namespace: testNamespace,
+          userId: ownerId,
+        });
       }
     }, 25000);
 
@@ -475,7 +551,12 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
         userId: ownerId,
       });
 
-      await provider.deleteLongTerm([id], { namespace: testNamespace });
+      const outcome = await provider.deleteLongTerm([id], {
+        key: "default",
+        namespace: testNamespace,
+        userId: ownerId,
+      });
+      expect(outcome.deletedIds).toEqual([id]);
 
       const { value, timedOut } = await poll(
         () =>
@@ -490,6 +571,58 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
       );
       expect(timedOut).toBe(false);
       expect(value.some((r) => r.id === id)).toBe(false);
+    }, 25000);
+
+    test("deleteLongTerm refuses a known id from another effective scope", async () => {
+      const provider = createRamProvider(parseMemoryConfig({ provider: "cloud" }));
+      const text = `Cross-scope delete guard ${randomUUID()}`;
+      const ownerA = `owner-a-${randomUUID().slice(0, 8)}`;
+      const ownerB = `owner-b-${randomUUID().slice(0, 8)}`;
+      const createdIds: string[] = [];
+
+      try {
+        const { id } = await provider.createLongTerm({
+          text,
+          key: "personal",
+          namespace: testNamespace,
+          userId: ownerA,
+        });
+        createdIds.push(id);
+
+        const hostileOutcome = await provider.deleteLongTerm([id], {
+          key: "shared",
+          namespace: testNamespace,
+          userId: ownerB,
+        });
+        expect(hostileOutcome).toMatchObject({
+          deletedIds: [],
+          forbiddenIds: [id],
+        });
+
+        const { value: stillPresent, timedOut } = await poll(
+          () => provider.searchLongTerm({
+            text,
+            limit: 5,
+            key: "personal",
+            namespace: testNamespace,
+            userId: ownerA,
+          }),
+          (memories) => memories.some((memory) => memory.id === id),
+          { intervalMs: 1000, timeoutMs: 15000 },
+        );
+        expect(timedOut).toBe(false);
+        expect(stillPresent.some((memory) => memory.id === id)).toBe(true);
+
+        const authorizedOutcome = await provider.deleteLongTerm([id], {
+          key: "personal",
+          namespace: testNamespace,
+          userId: ownerA,
+        });
+        expect(authorizedOutcome.deletedIds).toEqual([id]);
+        createdIds.splice(createdIds.indexOf(id), 1);
+      } finally {
+        await bulkDeleteBatched(createdIds);
+      }
     }, 25000);
   });
 
@@ -542,10 +675,19 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
             namespace: testNamespace,
             userId: ownerId,
           });
-          expect(checkpoint).toBe(base + 3000);
+          expect(checkpoint).toEqual({
+            maxTimestampMs: base + 3000,
+            messageIdsAtMax: [turn2[1].id],
+          });
 
           const afterFirstCapture = await client.getSessionMemory(sessionId);
           expect(afterFirstCapture.events).toHaveLength(4);
+          const effectiveOwnerId = deriveRamOwnerId(testNamespace, ownerId, "default");
+          const listed = await client.listSessions({
+            limit: 1,
+            filterOwnerId: effectiveOwnerId,
+          });
+          expect(listed.items).toContain(sessionId);
 
           const turn3: CapturedMessage[] = [
             {
@@ -583,8 +725,8 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
 
   describe("4. assumption checks", () => {
     test("health endpoint is at server root", async () => {
-      // RamClient.health() always calls `${serverUrl}/health`, never
-      // `${serverUrl}/v1/stores/{storeId}/health` (see client.ts). Resolving
+      // The official SDK calls `${serverUrl}/health`, never
+      // `${serverUrl}/v1/stores/{storeId}/health`. Resolving
       // here against real credentials confirms end-to-end that the root
       // /health path is reachable with the same bearer token used for every
       // store-scoped endpoint.
@@ -595,77 +737,199 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
     }, 15000);
 
     test(
-      "extraction: session events produce long-term memories",
+      "default plugin auto-capture extracts and auto-recalls through a production-derived session",
       async (ctx) => {
         const ownerId = `oc-it-owner-${randomUUID().slice(0, 8)}`;
-        const sessionId = `oc-it-session-${randomUUID().slice(0, 8)}`;
         const provider = createRamProvider(parseMemoryConfig({ provider: "cloud" }));
+        const scope = { key: "default", namespace: testNamespace, userId: ownerId };
+        const effectiveOwnerId = deriveRamOwnerId(
+          scope.namespace,
+          scope.userId,
+          scope.key,
+        );
+        const sessionKey = `agent:main:release-${randomUUID()}`;
+        const sessionId = provider.deriveCaptureSessionId(
+          sessionKey,
+          {
+            ...scope,
+            label: "Default",
+            summaryViewName: "unused",
+            summaryTimeWindowDays: 30,
+            summaryGroupBy: ["user_id"],
+          },
+        );
         allSessionIds.add(sessionId);
+        const harness = createFakeApi({
+          provider: "cloud",
+          namespace: testNamespace,
+          userId: ownerId,
+        });
+        await memoryPlugin.register(harness.api as any);
+        const agentEnd = harness.hooks.agent_end?.[0] as any;
+        const beforePrompt = harness.hooks.before_prompt_build?.[0] as any;
+        expect(agentEnd).toBeTypeOf("function");
+        expect(beforePrompt).toBeTypeOf("function");
+        expect(sessionId).toMatch(/^oc-s-[a-f0-9]{58}$/);
+        const otherScope = {
+          key: "other",
+          namespace: testNamespace,
+          userId: `${ownerId}-other`,
+        };
+        let hostileId: string | undefined;
 
         try {
           const now = Date.now();
-          await provider.captureMessages(
-            sessionId,
-            [
+          const uniqueFact = `release-fact-${randomUUID().slice(0, 8)}`;
+          await agentEnd(
+            {
+              success: true,
+              messages: [
               {
                 role: "user",
-                content: "My favorite color is teal and I live in Austin, Texas.",
+                content: `I am working on a Redis migration project called ${uniqueFact}.`,
                 id: randomUUID(),
-                timestampMs: now,
+                timestamp: now,
               },
               {
                 role: "assistant",
-                content: "Got it — teal is your favorite color and you live in Austin, Texas.",
+                content: `Understood. The Redis migration project is called ${uniqueFact}.`,
                 id: randomUUID(),
-                timestampMs: now + 1000,
+                timestamp: now + 1000,
               },
               {
                 role: "user",
-                content: "I also have a pet cat named Whiskers.",
+                content: `Please remember ${uniqueFact} as my project codename for future conversations.`,
                 id: randomUUID(),
-                timestampMs: now + 2000,
+                timestamp: now + 2000,
               },
               {
                 role: "assistant",
-                content: "Noted, your cat is named Whiskers.",
+                content: `I will remember that your project codename is ${uniqueFact}.`,
                 id: randomUUID(),
-                timestampMs: now + 3000,
+                timestamp: now + 3000,
               },
-            ],
-            { namespace: testNamespace, userId: ownerId },
+              ],
+            },
+            { agentId: "main", sessionKey },
           );
+
+          const capturedSession = await client.getSessionMemory(sessionId);
+          expect(capturedSession.ownerId).toBe(effectiveOwnerId);
+          // The default preserves complete conversational turns so RAM can
+          // extract memories from the dialogue. Operators can opt out of
+          // assistant retention with assistantCapture="exclude".
+          expect(capturedSession.events).toHaveLength(4);
+          expect(capturedSession.events.map((event) => event.role)).toEqual([
+            "USER", "ASSISTANT", "USER", "ASSISTANT",
+          ]);
 
           const { value, timedOut } = await poll(
             () =>
-              client.searchLongTermMemory({
-                filter: { namespace: { eq: testNamespace }, ownerId: { eq: ownerId } },
+              provider.searchLongTerm({
+                text: uniqueFact,
                 limit: 10,
+                ...scope,
               }),
-            (res) => res.memories.length > 0,
-            { intervalMs: 2000, timeoutMs: 60000 },
+            (res) => res.length > 0,
+            { intervalMs: 2000, timeoutMs: EXTRACTION_DEADLINE_MS },
           );
 
           if (timedOut) {
+            if (RELEASE_GATE) {
+              throw new Error(
+                `RAM extraction did not produce a recallable memory within ${EXTRACTION_DEADLINE_MS}ms`,
+              );
+            }
             console.warn(
-              "[assumption check] RAM did not extract any long-term memories from " +
-                `session "${sessionId}" (owner "${ownerId}") within 60s. This does not ` +
-                "necessarily mean extraction is broken — the service's extraction SLA is " +
-                "outside this plugin's control — but it means " +
-                "the live-timing half of that assumption could not be confirmed on this " +
-                "run. Skipping rather than failing.",
+              `[assumption check] RAM extraction exceeded ${EXTRACTION_DEADLINE_MS}ms; ` +
+                "developer run is skipping the timing assertion.",
             );
             ctx.skip();
             return;
           }
 
-          expect(value.memories.length).toBeGreaterThan(0);
+          expect(value.length).toBeGreaterThan(0);
+          const recalled = await beforePrompt(
+            { prompt: `What do you remember about ${uniqueFact}?` },
+            { agentId: "main", sessionKey },
+          );
+          expect(recalled?.prependContext).toContain("UNTRUSTED HISTORICAL DATA");
+          expect(recalled?.prependContext).toContain('"kind":"memory"');
+          expect(recalled?.prependContext).toContain(uniqueFact);
+
+          const isolated = await provider.searchLongTerm({
+            text: uniqueFact,
+            limit: 10,
+            ...otherScope,
+          });
+          expect(isolated).toHaveLength(0);
+
+          if (RELEASE_GATE) {
+            const direct = await provider.createLongTerm({
+              text: `direct-primary-${uniqueFact}`,
+              ...scope,
+            });
+            const hostile = await provider.createLongTerm({
+              text: `hostile-other-${uniqueFact}`,
+              ...otherScope,
+            });
+            hostileId = hostile.id;
+            const directVisible = await poll(
+              () => provider.searchLongTerm({
+                text: uniqueFact,
+                limit: 10,
+                ...scope,
+              }),
+              (memories) => memories.some((memory) => memory.id === direct.id),
+              { intervalMs: 1_000, timeoutMs: 15_000 },
+            );
+            expect(directVisible.timedOut).toBe(false);
+            const refused = await provider.deleteLongTerm([hostile.id], scope);
+            expect(refused.forbiddenIds).toEqual([hostile.id]);
+
+            const erased = await provider.eraseScope(scope, {
+              settleMs: 2_000,
+              maxRecords: 100,
+            });
+            expect(erased.status).toBe("verified_best_effort");
+            expect(erased.passes).toBe(2);
+            expect(erased.memoryIds).toContain(direct.id);
+            expect(erased.sessionIds).toContain(sessionId);
+            expect(erased.remainingMemoryIds).toEqual([]);
+            expect(erased.remainingSessionIds).toEqual([]);
+
+            const hostileStillPresent = await poll(
+              () => provider.searchLongTerm({
+                text: uniqueFact,
+                limit: 10,
+                ...otherScope,
+              }),
+              (memories) => memories.some((memory) => memory.id === hostile.id),
+              { intervalMs: 1_000, timeoutMs: 15_000 },
+            );
+            expect(hostileStillPresent.timedOut).toBe(false);
+          }
         } finally {
+          if (hostileId) {
+            await provider.deleteLongTerm([hostileId], otherScope);
+          }
           await safeDeleteSession(sessionId);
           allSessionIds.delete(sessionId);
-          await sweepByFilter({ namespace: { eq: testNamespace }, ownerId: { eq: ownerId } });
+          await sweepByFilter({ ownerId: { eq: effectiveOwnerId } });
+          if (RELEASE_GATE) {
+            const absent = await poll(
+              () => client.searchLongTermMemory({
+                filter: { ownerId: { eq: effectiveOwnerId } },
+                limit: 10,
+              }),
+              (response) => response.items.length === 0,
+              { intervalMs: 1000, timeoutMs: 20_000 },
+            );
+            expect(absent.timedOut).toBe(false);
+          }
         }
       },
-      75000,
+      EXTRACTION_DEADLINE_MS + 45_000,
     );
   });
 
@@ -722,9 +986,155 @@ describeRamLive("RAM (Redis Agent Memory) — live integration suite (Story 06)"
         if (memoryId) {
           // The forget step never ran (an earlier assertion threw) — best-effort
           // direct cleanup on top of the outer afterAll's namespace-wide sweep.
-          await client.bulkDeleteLongTermMemories([memoryId]).catch(() => {});
+          await client.bulkDeleteLongTermMemories({ memoryIds: [memoryId] }).catch(() => {});
         }
       }
     }, 45000);
   });
+
+  test.runIf(RELEASE_GATE)("bounded cloud pilot canary meets capture and recall targets", async () => {
+    const sessionCount = 4;
+    const captureLatencies: number[] = [];
+    const recallLatencies: number[] = [];
+    let errors = 0;
+    let cleanupErrors = 0;
+    const cleanup: Array<{
+      provider: ReturnType<typeof createRamProvider>;
+      scope: { key: string; namespace: string; userId: string };
+      sessionId: string;
+      memoryId?: string;
+    }> = [];
+
+    try {
+      await Promise.all(Array.from({ length: sessionCount }, async (_, index) => {
+        const provider = createRamProvider(parseMemoryConfig({ provider: "cloud" }));
+        const scope = {
+          key: `pilot_${index}`,
+          namespace: testNamespace,
+          userId: `pilot-user-${randomUUID().slice(0, 8)}`,
+        };
+        const sessionId = provider.deriveCaptureSessionId(`pilot-session-${randomUUID()}`, {
+          ...scope,
+          label: scope.key,
+          summaryViewName: "unused",
+          summaryTimeWindowDays: 30,
+          summaryGroupBy: ["user_id"],
+        });
+        const cleanupRecord = { provider, scope, sessionId, memoryId: undefined as string | undefined };
+        cleanup.push(cleanupRecord);
+        allSessionIds.add(sessionId);
+        const started = performance.now();
+        try {
+          await provider.captureMessages(sessionId, [
+            {
+              role: "user",
+              content: `Bounded cloud capture canary ${index}`,
+              id: randomUUID(),
+              timestampMs: Date.now(),
+            },
+            {
+              role: "user",
+              content: `Second bounded cloud capture event ${index}`,
+              id: randomUUID(),
+              timestampMs: Date.now() + 1,
+            },
+          ], scope);
+        } catch (error) {
+          errors += 1;
+          throw error;
+        } finally {
+          captureLatencies.push(performance.now() - started);
+        }
+
+        const text = `bounded-recall-${randomUUID()}`;
+        const created = await provider.createLongTerm({ text, ...scope });
+        cleanupRecord.memoryId = created.id;
+        const recallStarted = performance.now();
+        try {
+          const result = await provider.searchLongTerm({ text, limit: 3, ...scope });
+          expect(result.some((memory) => memory.id === created.id)).toBe(true);
+        } catch (error) {
+          errors += 1;
+          throw error;
+        } finally {
+          recallLatencies.push(performance.now() - recallStarted);
+        }
+      }));
+    } finally {
+      await Promise.all(cleanup.map(async ({ provider, scope, sessionId, memoryId }) => {
+        try {
+          const erased = await provider.eraseScope(scope, { settleMs: 2_000, maxRecords: 100 });
+          if (
+            erased.status !== "verified_best_effort" ||
+            erased.remainingMemoryIds.length > 0 ||
+            erased.remainingSessionIds.length > 0
+          ) {
+            cleanupErrors += 1;
+          }
+        } catch {
+          cleanupErrors += 1;
+        } finally {
+          if (memoryId) await provider.deleteLongTerm([memoryId], scope).catch(() => {
+            cleanupErrors += 1;
+          });
+          await safeDeleteSession(sessionId);
+          const ownerId = deriveRamOwnerId(scope.namespace, scope.userId, scope.key);
+          await sweepByFilter({ ownerId: { eq: ownerId } });
+          try {
+            const remaining = await client.searchLongTermMemory({
+              filter: { ownerId: { eq: ownerId } },
+              limit: 1,
+            });
+            if (remaining.items.length > 0) cleanupErrors += 1;
+          } catch {
+            cleanupErrors += 1;
+          }
+          allSessionIds.delete(sessionId);
+        }
+      }));
+    }
+
+    const summarize = (values: number[]) => {
+      const sorted = [...values].sort((left, right) => left - right);
+      if (sorted.length === 0) {
+        return { samples: 0, p50: null, p95: null, p99: null };
+      }
+      const percentile = (fraction: number) => sorted[
+        Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)
+      ];
+      return {
+        samples: sorted.length,
+        p50: Number(percentile(0.50).toFixed(2)),
+        p95: Number(percentile(0.95).toFixed(2)),
+        p99: Number(percentile(0.99).toFixed(2)),
+      };
+    };
+    const metrics = {
+      kind: "bounded_cloud_pilot_canary",
+      targets: {
+        concurrentSessions: sessionCount,
+        messagesPerSession: 2,
+        captureP95Ms: 30_000,
+        recallP95Ms: 20_000,
+        errors: 0,
+      },
+      observations: {
+        errors,
+        cleanupErrors,
+        captureLatencyMs: summarize(captureLatencies),
+        recallLatencyMs: summarize(recallLatencies),
+      },
+    };
+    writeReleaseArtifact(
+      `node${process.versions.node.split(".")[0]}-pass${process.env.RAM_RELEASE_RUN ?? "0"}-cloud-pilot`,
+      metrics,
+    );
+    console.info(`[ram-cloud-pilot] ${JSON.stringify(metrics)}`);
+    expect(errors).toBe(0);
+    expect(cleanupErrors).toBe(0);
+    expect(metrics.observations.captureLatencyMs.samples).toBe(sessionCount);
+    expect(metrics.observations.recallLatencyMs.samples).toBe(sessionCount);
+    expect(metrics.observations.captureLatencyMs.p95 ?? Infinity).toBeLessThanOrEqual(30_000);
+    expect(metrics.observations.recallLatencyMs.p95 ?? Infinity).toBeLessThanOrEqual(20_000);
+  }, 180_000);
 });

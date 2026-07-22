@@ -1,8 +1,11 @@
-name: Release
+name: Release Gate
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -39,7 +42,7 @@ jobs:
       - if: always() && matrix.node-version == 22
         uses: actions/upload-artifact@v4
         with:
-          name: bounded-load-release-${{ github.run_id }}-${{ github.run_attempt }}-node22
+          name: bounded-load-${{ github.run_id }}-${{ github.run_attempt }}-node22
           path: artifacts/load/
           if-no-files-found: error
 
@@ -58,6 +61,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run build
       - name: Require RAM release credentials
         env:
           AGENT_MEMORY_ENDPOINT: ${{ secrets.AGENT_MEMORY_ENDPOINT }}
@@ -73,7 +77,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ram-live-release-${{ github.run_id }}-${{ github.run_attempt }}-node22
+          name: ram-live-${{ github.run_id }}-${{ github.run_attempt }}-node22
           path: artifacts/ram-live/
           if-no-files-found: error
 
@@ -113,27 +117,3 @@ jobs:
         run: npm test -- src/index.test.ts
       - if: always()
         run: docker rm -f agent-memory-release || true
-
-  publish:
-    needs: [ram-live, self-hosted-live]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: CI
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Use Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Publish to npm
-        run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

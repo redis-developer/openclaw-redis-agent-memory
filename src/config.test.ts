@@ -38,6 +38,31 @@ afterEach(() => {
 });
 
 describe("parseMemoryConfig — provider resolution", () => {
+  const validCloud = {
+    provider: "cloud",
+    serverUrl: "https://cloud.example.com",
+    apiKey: "valid-api-key",
+    storeId: "valid-store-id",
+  } as const;
+
+  test("rejects an empty workingMemorySessionId", () => {
+    expect(() =>
+      parseMemoryConfig({
+        serverUrl: "http://localhost:8000",
+        workingMemorySessionId: "   ",
+      }),
+    ).toThrow(/workingMemorySessionId must not be empty/);
+  });
+
+  test("rejects an empty workingMemorySessionId inside a named scope", () => {
+    expect(() =>
+      parseMemoryConfig({
+        serverUrl: "http://localhost:8000",
+        scopes: { personal: { workingMemorySessionId: "" } },
+      }),
+    ).toThrow(/scope "personal" workingMemorySessionId must not be empty/);
+  });
+
   test("legacy config with only serverUrl resolves to self-hosted with existing defaults intact", () => {
     const config = parseMemoryConfig({ serverUrl: "http://localhost:8000" });
 
@@ -51,17 +76,74 @@ describe("parseMemoryConfig — provider resolution", () => {
     expect(config.summaryViewName).toBe("agent_user_summary");
     expect(config.summaryTimeWindowDays).toBe(30);
     expect(config.cloudIgnoredOptions).toEqual([]);
+    expect(config.assistantCapture).toBe("include");
+    expect(config.sensitiveDataRedaction).toBe(false);
+    expect(config.recallRecordMaxChars).toBe(2000);
+    expect(config.recallContextMaxChars).toBe(16000);
+    expect(config.erasureSettleMs).toBe(2000);
+  });
+
+  test("parses privacy controls and per-scope opt-outs strictly", () => {
+    const config = parseMemoryConfig({
+      serverUrl: "http://localhost:8000",
+      assistantCapture: "include",
+      sensitiveDataRedaction: true,
+      sessionRetentionSeconds: 3600,
+      recallRecordMaxChars: 512,
+      recallContextMaxChars: 4096,
+      erasureSettleMs: 0,
+      scopes: {
+        private: {
+          autoRecall: false,
+          autoCapture: false,
+          assistantCapture: "exclude",
+          sensitiveDataRedaction: false,
+          sessionRetentionSeconds: 600,
+        },
+      },
+    });
+    expect(config.sessionRetentionSeconds).toBe(3600);
+    expect(config.scopes?.private).toMatchObject({
+      autoRecall: false,
+      autoCapture: false,
+      assistantCapture: "exclude",
+      sensitiveDataRedaction: false,
+      sessionRetentionSeconds: 600,
+    });
+  });
+
+  test.each([
+    [{ assistantCapture: "sometimes" }, /assistantCapture must be exclude or include/],
+    [{ sensitiveDataRedaction: "yes" }, /sensitiveDataRedaction must be a boolean/],
+    [{ sessionRetentionSeconds: 59 }, /sessionRetentionSeconds must be between 60/],
+    [{ recallRecordMaxChars: 127 }, /recallRecordMaxChars must be between 128/],
+    [{ recallContextMaxChars: 1000 }, /recallContextMaxChars must be between 1024/],
+    [{ recallRecordMaxChars: 5000, recallContextMaxChars: 4000 }, /must not exceed/],
+    [{ erasureSettleMs: 60001 }, /erasureSettleMs must be between 0 and 60000/],
+  ])("rejects invalid privacy config %#", (partial, expected) => {
+    expect(() => parseMemoryConfig({ serverUrl: "http://localhost:8000", ...partial })).toThrow(expected);
+  });
+
+  test("rejects session retention for RAM cloud instead of pretending it applies", () => {
+    expect(() => parseMemoryConfig({
+      ...validCloud,
+      sessionRetentionSeconds: 3600,
+    })).toThrow(/not supported by the cloud provider/);
+    expect(() => parseMemoryConfig({
+      ...validCloud,
+      scopes: { private: { sessionRetentionSeconds: 3600 } },
+    })).toThrow(/not supported by the cloud provider/);
   });
 
   test("empty config with all three env vars set resolves to cloud using env values", () => {
-    process.env.AGENT_MEMORY_ENDPOINT = "https://cloud.example.com/memory";
+    process.env.AGENT_MEMORY_ENDPOINT = "https://cloud.example.com";
     process.env.AGENT_MEMORY_API_KEY = "env-api-key";
     process.env.AGENT_MEMORY_STORE_ID = "env-store-id";
 
     const config = parseMemoryConfig({});
 
     expect(config.provider).toBe("cloud");
-    expect(config.serverUrl).toBe("https://cloud.example.com/memory");
+    expect(config.serverUrl).toBe("https://cloud.example.com");
     expect(config.apiKey).toBe("env-api-key");
     expect(config.storeId).toBe("env-store-id");
     expect(config.cloudIgnoredOptions).toEqual([]);
@@ -120,7 +202,7 @@ describe("parseMemoryConfig — provider resolution", () => {
     expect(() =>
       parseMemoryConfig({
         provider: "cloud",
-        serverUrl: "https://cloud.example.com/memory",
+        serverUrl: "https://cloud.example.com",
         apiKey: "valid-api-key",
         storeId: "valid-store-id",
         bearerToken: "some-token",
@@ -131,7 +213,7 @@ describe("parseMemoryConfig — provider resolution", () => {
   test("cloud config with extractionStrategy set parses fine and records cloudIgnoredOptions", () => {
     const config = parseMemoryConfig({
       provider: "cloud",
-      serverUrl: "https://cloud.example.com/memory",
+      serverUrl: "https://cloud.example.com",
       apiKey: "valid-api-key",
       storeId: "valid-store-id",
       extractionStrategy: "summary",
@@ -145,7 +227,7 @@ describe("parseMemoryConfig — provider resolution", () => {
   test("cloudIgnoredOptions detects options set only inside a scope, deduplicated, bare names", () => {
     const config = parseMemoryConfig({
       provider: "cloud",
-      serverUrl: "https://cloud.example.com/memory",
+      serverUrl: "https://cloud.example.com",
       apiKey: "valid-api-key",
       storeId: "valid-store-id",
       summaryTimeWindowDays: 14,
@@ -187,7 +269,7 @@ describe("parseMemoryConfig — provider resolution", () => {
 
     const config = parseMemoryConfig({
       provider: "cloud",
-      serverUrl: "https://cloud.example.com/memory",
+      serverUrl: "https://cloud.example.com",
       apiKey: "valid-api-key",
       storeId: "${CONFIG_TEST_STORE_ID}",
     });
@@ -204,5 +286,115 @@ describe("parseMemoryConfig — provider resolution", () => {
         cloudIgnoredOptions: ["extractionStrategy"],
       }),
     ).toThrow(/unknown keys.*cloudIgnoredOptions/i);
+  });
+
+  test.each([
+    ["malformed", "not a URL", /absolute HTTP/],
+    ["insecure cloud", "http://cloud.example.com", /must use HTTPS/],
+    ["credentials", "https://user:password@cloud.example.com", /embedded credentials/],
+    ["fragment", "https://cloud.example.com/#secret", /fragment/],
+    ["query", "https://cloud.example.com/?token=secret", /query parameters/],
+    ["path", "https://cloud.example.com/api", /must not contain a path/],
+    ["unsupported scheme", "ftp://cloud.example.com", /HTTP or HTTPS/],
+  ])("rejects %s cloud URLs", (_label, serverUrl, expected) => {
+    expect(() => parseMemoryConfig({ ...validCloud, serverUrl })).toThrow(expected);
+  });
+
+  test("allows self-hosted HTTP only on loopback hosts", () => {
+    for (const serverUrl of [
+      "http://localhost:8000",
+      "http://dev.localhost:8000",
+      "http://127.44.1.9:8000",
+      "http://[::1]:8000",
+    ]) {
+      expect(parseMemoryConfig({ provider: "self-hosted", serverUrl }).serverUrl).toBe(serverUrl);
+    }
+    expect(() =>
+      parseMemoryConfig({ provider: "self-hosted", serverUrl: "http://10.0.0.8:8000" }),
+    ).toThrow(/loopback/);
+    expect(
+      parseMemoryConfig({ provider: "self-hosted", serverUrl: "https://memory.internal" }).serverUrl,
+    ).toBe("https://memory.internal");
+  });
+
+  test.each([
+    ["apiKey", "   ", /apiKey must not be blank/],
+    ["storeId", "bad/store", /storeId contains unsupported characters/],
+    ["storeId", "x".repeat(65), /at most 64/],
+    ["namespace", "bad_namespace", /namespace contains unsupported characters/],
+    ["userId", "alice@example.com", /userId contains unsupported characters/],
+    ["workingMemorySessionId", "session:one", /workingMemorySessionId contains unsupported/],
+  ])("rejects invalid cloud %s", (field, value, expected) => {
+    expect(() => parseMemoryConfig({ ...validCloud, [field]: value })).toThrow(expected);
+  });
+
+  test.each([
+    ["timeout", 0, /between 100 and 120000/],
+    ["timeout", -1, /between 100 and 120000/],
+    ["timeout", 120_001, /between 100 and 120000/],
+    ["timeout", 100.5, /finite integer/],
+    ["recallLimit", 0, /between 1 and 100/],
+    ["recallLimit", 101, /between 1 and 100/],
+    ["recallLimit", 1.5, /finite integer/],
+    ["minScore", -0.1, /between 0 and 1/],
+    ["minScore", 1.1, /between 0 and 1/],
+  ])("rejects out-of-contract numeric config %s=%s", (field, value, expected) => {
+    expect(() => parseMemoryConfig({ ...validCloud, [field]: value })).toThrow(expected);
+  });
+
+  test.each([
+    ["timeout", "30000"],
+    ["autoCapture", "true"],
+    ["namespace", 42],
+    ["summaryGroupBy", "namespace"],
+  ])("rejects wrong-type config field %s", (field, value) => {
+    expect(() => parseMemoryConfig({ ...validCloud, [field]: value })).toThrow();
+  });
+
+  test("bounds configured scopes and route lists", () => {
+    const tooManyScopes = Object.fromEntries(
+      Array.from({ length: 33 }, (_, index) => [`scope_${index}`, {}]),
+    );
+    expect(() => parseMemoryConfig({ ...validCloud, scopes: tooManyScopes })).toThrow(/between 1 and 32/);
+    expect(() => parseMemoryConfig({
+      ...validCloud,
+      scopes: { one: {} },
+      agentScopes: {
+        main: {
+          primaryScope: "one",
+          recallScopes: Array.from({ length: 33 }, () => "one"),
+        },
+      },
+    })).toThrow(/at most 32/);
+  });
+
+  test("configuration failures never echo configured secrets", () => {
+    const secret = "do-not-print-this-key";
+    let message = "";
+    try {
+      parseMemoryConfig({
+        ...validCloud,
+        apiKey: secret,
+        serverUrl: "https://user:password@cloud.example.com",
+      });
+    } catch (error) {
+      message = String(error);
+    }
+    expect(message).not.toContain(secret);
+    expect(message).not.toContain("password");
+  });
+
+  test("bounded numeric fuzz cases fail deterministically instead of being coerced", () => {
+    const invalidNumbers = [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      -Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER,
+      ...Array.from({ length: 50 }, (_, index) => index + 0.25),
+    ];
+    for (const timeout of invalidNumbers) {
+      expect(() => parseMemoryConfig({ ...validCloud, timeout })).toThrow();
+    }
   });
 });

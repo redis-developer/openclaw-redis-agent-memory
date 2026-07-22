@@ -50,7 +50,6 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -60,6 +59,24 @@ import type { PluginApi, PluginDefinition } from "./types.js";
 import { stringEnum } from "./types.js";
 import { createProvider } from "./providers/factory.js";
 import type { CapturedMessage } from "./provider.js";
+import { CaptureCoordinator } from "./capture.js";
+import { applyCapturePrivacy } from "./privacy.js";
+import { frameUntrustedMemories, type UntrustedMemoryRecord } from "./trust.js";
+import { distributeBudget, mapWithConcurrency } from "./bounded.js";
+import {
+  CONFIG_KEY_PATTERN,
+  MAX_IDENTIFIER_CHARS,
+  MAX_MEMORY_TEXT_CHARS,
+  MAX_RECALL_LIMIT,
+  MAX_SEARCH_TEXT_CHARS,
+  SERVICE_IDENTIFIER_PATTERN,
+  assertIntegerInRange,
+  assertMemoryText,
+  assertSearchText,
+  assertServiceIdentifier,
+  normalizeExternalMessageId,
+  safeErrorMessage,
+} from "./validation.js";
 import {
   getConfiguredScopes,
   resolveAgentScopePlan,
@@ -83,6 +100,9 @@ export function readSessionIdFromStore(sessionKey: string): string | null {
     // Extract agentId from sessionKey (e.g., "agent:main:main" -> "main")
     const parts = sessionKey.split(":");
     const agentId = parts.length >= 2 ? parts[1] : "main";
+    if (!CONFIG_KEY_PATTERN.test(agentId) || agentId.length > MAX_IDENTIFIER_CHARS) {
+      return null;
+    }
 
     const storePath = path.join(os.homedir(), ".openclaw", "agents", agentId, "sessions", "sessions.json");
 
@@ -109,6 +129,9 @@ export function readSessionIdFromStore(sessionKey: string): string | null {
 
 const MEMORY_CATEGORIES = ["preference", "fact", "decision", "entity", "other"] as const;
 type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
+const MAX_TOOL_OUTPUT_CHARS = 32_000;
+const MAX_TOOL_RECORD_TEXT_CHARS = 2_000;
+const MAX_SCOPED_SEARCH_CONCURRENCY = 4;
 
 type MemorySearchResult = {
   id: string;
@@ -119,7 +142,33 @@ type MemorySearchResult = {
   entities?: string[];
   scope?: string;
   scopeLabel?: string;
+  memoryType?: string;
+  source?: string;
 };
+
+function truncateVisibleText(value: string, maximum: number): string {
+  const marker = "\n[truncated]";
+  return value.length <= maximum
+    ? value
+    : value.slice(0, Math.max(0, maximum - marker.length)) + marker;
+}
+
+function boundToolMemories(memories: MemorySearchResult[]): MemorySearchResult[] {
+  const perRecord = Math.max(
+    128,
+    Math.min(
+      MAX_TOOL_RECORD_TEXT_CHARS,
+      Math.floor((MAX_TOOL_OUTPUT_CHARS - 12_000) / Math.max(1, memories.length)),
+    ),
+  );
+  return memories.map((memory) => ({
+    id: memory.id,
+    text: truncateVisibleText(memory.text, perRecord),
+    score: memory.score,
+    scope: memory.scope,
+    scopeLabel: memory.scopeLabel,
+  }));
+}
 
 // ============================================================================
 // Message conversion helpers
@@ -180,6 +229,8 @@ function stripEnvelopeForSearch(text: string): string {
  */
 export function convertToMemoryMessages(messages: unknown[]): CapturedMessage[] {
   const result: CapturedMessage[] = [];
+  const syntheticOccurrences = new Map<string, number>();
+  let lastTimestampMs = 1577836800000; // Stable fallback base: 2020-01-01 UTC.
 
   for (const msg of messages) {
     if (!msg || typeof msg !== "object") continue;
@@ -194,17 +245,36 @@ export function convertToMemoryMessages(messages: unknown[]): CapturedMessage[] 
     const content = extractTextContent(msgObj.content);
     if (!content.trim()) continue;
 
-    // Skip injected memory context
-    if (content.includes("<relevant-memories>")) continue;
+    // Skip both legacy and current injected memory context.
+    if (
+      content.includes("<relevant-memories>") ||
+      content.includes("<untrusted-memory-context")
+    ) continue;
 
-    // Preserve original timestamp from pi-ai message (Unix ms), fallback to now
-    const msgTimestamp =
-      typeof msgObj.timestamp === "number" ? msgObj.timestamp : Date.now();
+    // Missing transport fields must be stable across repeated hook delivery
+    // and process restarts. A transcript-derived occurrence id distinguishes
+    // repeated identical messages without depending on wall-clock time.
+    const identitySeed = JSON.stringify([role, content]);
+    const occurrence = syntheticOccurrences.get(identitySeed) ?? 0;
+    syntheticOccurrences.set(identitySeed, occurrence + 1);
+    const id = normalizeExternalMessageId(
+      msgObj.id,
+      JSON.stringify([role, content, occurrence]),
+    );
+
+    const hasTimestamp =
+      typeof msgObj.timestamp === "number" &&
+      Number.isFinite(msgObj.timestamp) &&
+      Number.isInteger(msgObj.timestamp) &&
+      msgObj.timestamp >= 0 &&
+      msgObj.timestamp <= 8_640_000_000_000_000;
+    const msgTimestamp = hasTimestamp ? msgObj.timestamp as number : lastTimestampMs + 1;
+    lastTimestampMs = msgTimestamp;
 
     result.push({
       role,
       content,
-      id: typeof msgObj.id === "string" ? msgObj.id : randomUUID(),
+      id,
       timestampMs: msgTimestamp,
     });
   }
@@ -247,13 +317,12 @@ const redisMemoryPlugin: PluginDefinition = {
 
     const namespaceLabel = cfg.namespace ?? "default";
     if (cfg.provider === "cloud") {
-      // Never log apiKey/bearerToken. storeId identifies the cloud tenant.
       api.logger.info?.(
-        `redis-memory: plugin registered (backend: cloud, server: ${cfg.serverUrl}, storeId: ${cfg.storeId}, namespace: ${namespaceLabel})`,
+        `redis-memory: plugin registered (backend: cloud, server: ${cfg.serverUrl}, namespace: ${JSON.stringify(namespaceLabel)})`,
       );
     } else {
       api.logger.info?.(
-        `redis-memory: plugin registered (backend: self-hosted, server: ${cfg.serverUrl}, namespace: ${namespaceLabel})`,
+        `redis-memory: plugin registered (backend: self-hosted, server: ${cfg.serverUrl}, namespace: ${JSON.stringify(namespaceLabel)})`,
       );
     }
 
@@ -274,8 +343,13 @@ const redisMemoryPlugin: PluginDefinition = {
     // Scope helpers
     // ========================================================================
 
-    // Track max message timestamp per session/scope pair to avoid re-sending messages
-    const sessionMaxTimestamps = new Map<string, number>();
+    const captureCoordinator = new CaptureCoordinator(provider, api.logger);
+    const erasingScopes = new Set<string>();
+    const sensitiveValues = [cfg.apiKey, cfg.bearerToken];
+
+    function reportFailure(operation: string, error: unknown): void {
+      api.logger.warn(`redis-memory: ${operation} failed: ${safeErrorMessage(error, sensitiveValues)}`);
+    }
 
     function buildTrackingKey(scope: ScopedMemoryTarget, workingMemorySessionId: string): string {
       return `${scope.key}::${workingMemorySessionId}`;
@@ -285,16 +359,15 @@ const redisMemoryPlugin: PluginDefinition = {
       sessionKey: string,
       scope: ScopedMemoryTarget,
     ): string {
+      let sessionIdentity: string;
       if (scope.workingMemorySessionId) {
-        return scope.workingMemorySessionId;
+        sessionIdentity = scope.workingMemorySessionId;
+      } else {
+        const sessionId = readSessionIdFromStore(sessionKey);
+        sessionIdentity = sessionId ? `${sessionKey}:${sessionId}` : sessionKey;
       }
 
-      const sessionId = readSessionIdFromStore(sessionKey);
-      if (sessionId) {
-        return `${sessionKey}:${sessionId}`;
-      }
-
-      return sessionKey;
+      return provider.deriveCaptureSessionId(sessionIdentity, scope);
     }
 
     function getToolPlan(ctx?: AgentScopeContext): AgentScopePlan {
@@ -316,6 +389,7 @@ const redisMemoryPlugin: PluginDefinition = {
       const results = await provider.searchLongTerm({
         text: query,
         limit,
+        key: scope.key,
         namespace: scope.namespace,
         userId: scope.userId,
         minScore: cfg.minScore,
@@ -330,6 +404,8 @@ const redisMemoryPlugin: PluginDefinition = {
         score: result.score,
         topics: result.topics,
         entities: result.entities,
+        memoryType: result.memoryType,
+        source: result.source,
         scope: scope.key,
         scopeLabel: scope.label,
       }));
@@ -361,8 +437,16 @@ const redisMemoryPlugin: PluginDefinition = {
         });
         const scopeKeys = plan.recallScopes.map((scope) => scope.key);
         const parameters: Record<string, unknown> = {
-          query: Type.String({ description: "Search query" }),
-          limit: Type.Optional(Type.Number({ description: "Max results (default: 5)" })),
+          query: Type.String({
+            description: "Search query",
+            minLength: 1,
+            maxLength: MAX_SEARCH_TEXT_CHARS,
+          }),
+          limit: Type.Optional(Type.Integer({
+            description: "Max results (default: 5)",
+            minimum: 1,
+            maximum: MAX_RECALL_LIMIT,
+          })),
         };
         if (scopeKeys.length > 1) {
           parameters.scope = Type.Optional(
@@ -380,22 +464,45 @@ const redisMemoryPlugin: PluginDefinition = {
             describeScopes(plan.recallScopes, plan.defaultStoreScope),
           parameters: Type.Object(parameters as Record<string, any>),
           async execute(_toolCallId, params) {
-            const { query, limit = 5, scope: scopeKey } = params as {
+            const input =
+              params && typeof params === "object" && !Array.isArray(params)
+                ? params as Record<string, unknown>
+                : {};
+            const { query, limit = 5, scope: scopeKey } = input as {
               query: string;
               limit?: number;
               scope?: string;
             };
 
             try {
+              assertSearchText(query, "query");
+              assertIntegerInRange(limit, "limit", 1, MAX_RECALL_LIMIT);
+              if (scopeKey !== undefined && typeof scopeKey !== "string") {
+                throw new Error("scope must be a string");
+              }
               const targetScopes = scopeKey
                 ? [resolveSelectedScope(scopeKey, plan.recallScopes, plan.defaultStoreScope)]
                 : plan.recallScopes;
 
-              const scopedResults = await Promise.all(
-                targetScopes.map(async (scope) => ({
+              // Divide one global result budget across scopes. This keeps a
+              // 32-scope configuration from fetching and buffering 32 times
+              // the requested limit, while bounded fan-out avoids a burst of
+              // simultaneous backend requests.
+              const retrievalBudget = Math.min(
+                MAX_RECALL_LIMIT,
+                Math.max(limit, targetScopes.length),
+              );
+              const quotas = distributeBudget(retrievalBudget, targetScopes.length);
+              const searchableScopes = targetScopes
+                .map((scope, index) => ({ scope, limit: quotas[index] }))
+                .filter((entry) => entry.limit > 0);
+              const scopedResults = await mapWithConcurrency(
+                searchableScopes,
+                MAX_SCOPED_SEARCH_CONCURRENCY,
+                async ({ scope, limit: scopeLimit }) => ({
                   scope,
-                  memories: await searchScope(scope, query, limit),
-                })),
+                  memories: await searchScope(scope, query, scopeLimit),
+                }),
               );
 
               // Scoreless providers (RAM) return no per-result score: the
@@ -420,7 +527,8 @@ const redisMemoryPlugin: PluginDefinition = {
                 };
               }
 
-              const text = merged
+              const boundedMemories = boundToolMemories(merged);
+              const text = boundedMemories
                 .map((memory, index) => {
                   const prefix =
                     targetScopes.length > 1
@@ -438,14 +546,20 @@ const redisMemoryPlugin: PluginDefinition = {
                 .join("\n");
 
               return {
-                content: [{ type: "text", text: `Found ${merged.length} memories:\n\n${text}` }],
-                details: { count: merged.length, memories: merged },
+                content: [{
+                  type: "text",
+                  text: truncateVisibleText(
+                    `Found ${boundedMemories.length} memories:\n\n${text}`,
+                    MAX_TOOL_OUTPUT_CHARS,
+                  ),
+                }],
+                details: { count: boundedMemories.length, memories: boundedMemories },
               };
             } catch (err) {
-              api.logger.warn(`redis-memory: recall failed: ${String(err)}`);
+              reportFailure("recall", err);
               return {
-                content: [{ type: "text", text: `Memory search failed: ${String(err)}` }],
-                details: { error: String(err) },
+                content: [{ type: "text", text: "Memory search failed." }],
+                details: { error: "backend_error" },
               };
             }
           },
@@ -462,7 +576,11 @@ const redisMemoryPlugin: PluginDefinition = {
         });
         const scopeKeys = plan.toolScopes.map((scope) => scope.key);
         const parameters: Record<string, unknown> = {
-          text: Type.String({ description: "Information to remember" }),
+          text: Type.String({
+            description: "Information to remember",
+            minLength: 1,
+            maxLength: MAX_MEMORY_TEXT_CHARS,
+          }),
           category: Type.Optional(stringEnum(MEMORY_CATEGORIES)),
         };
         if (scopeKeys.length > 1) {
@@ -481,13 +599,17 @@ const redisMemoryPlugin: PluginDefinition = {
             describeScopes(plan.toolScopes, plan.defaultStoreScope),
           parameters: Type.Object(parameters as Record<string, any>),
           async execute(_toolCallId, params) {
-            const { text, category, scope: scopeKey } = params as {
+            const input =
+              params && typeof params === "object" && !Array.isArray(params)
+                ? params as Record<string, unknown>
+                : {};
+            const { text, category, scope: scopeKey } = input as {
               text: string;
               category?: MemoryCategory;
               scope?: string;
             };
 
-            if (!text || !text.trim()) {
+            if (typeof text !== "string" || !text.trim()) {
               return {
                 content: [
                   {
@@ -500,6 +622,13 @@ const redisMemoryPlugin: PluginDefinition = {
             }
 
             try {
+              assertMemoryText(text, "text");
+              if (category !== undefined && !MEMORY_CATEGORIES.includes(category)) {
+                throw new Error("category is invalid");
+              }
+              if (scopeKey !== undefined && typeof scopeKey !== "string") {
+                throw new Error("scope must be a string");
+              }
               const targetScope = resolveSelectedScope(
                 scopeKey,
                 plan.toolScopes,
@@ -508,25 +637,30 @@ const redisMemoryPlugin: PluginDefinition = {
               const inferredCategory = category ?? detectCategory(text);
               const dup = await provider.findDuplicate({
                 text,
+                key: targetScope.key,
                 namespace: targetScope.namespace,
                 userId: targetScope.userId,
               });
 
               if (dup) {
+                const duplicateText = truncateVisibleText(
+                  dup.text,
+                  MAX_TOOL_RECORD_TEXT_CHARS,
+                );
                 return {
                   content: [
                     {
                       type: "text",
                       text:
                         `Similar memory already exists in ${targetScope.label}: ` +
-                        `"${dup.text}"`,
+                        `"${duplicateText}"`,
                     },
                   ],
                   details: {
                     action: "duplicate",
                     scope: targetScope.key,
                     existingId: dup.id,
-                    existingText: dup.text,
+                    existingText: duplicateText,
                   },
                 };
               }
@@ -534,6 +668,7 @@ const redisMemoryPlugin: PluginDefinition = {
               const { id: memoryId } = await provider.createLongTerm({
                 text,
                 topics: [inferredCategory],
+                key: targetScope.key,
                 namespace: targetScope.namespace,
                 userId: targetScope.userId,
               });
@@ -548,10 +683,10 @@ const redisMemoryPlugin: PluginDefinition = {
                 details: { action: "created", id: memoryId, scope: targetScope.key },
               };
             } catch (err) {
-              api.logger.warn(`redis-memory: store failed: ${String(err)}`);
+              reportFailure("store", err);
               return {
-                content: [{ type: "text", text: `Memory store failed: ${String(err)}` }],
-                details: { error: String(err) },
+                content: [{ type: "text", text: "Memory store failed." }],
+                details: { error: "backend_error" },
               };
             }
           },
@@ -568,13 +703,22 @@ const redisMemoryPlugin: PluginDefinition = {
         });
         const scopeKeys = plan.toolScopes.map((scope) => scope.key);
         const parameters: Record<string, unknown> = {
-          query: Type.Optional(Type.String({ description: "Search to find memory" })),
-          memoryId: Type.Optional(Type.String({ description: "Specific memory ID" })),
+          query: Type.Optional(Type.String({
+            description: "Search to find memory",
+            minLength: 1,
+            maxLength: MAX_SEARCH_TEXT_CHARS,
+          })),
+          memoryId: Type.Optional(Type.String({
+            description: "Specific memory ID",
+            minLength: 1,
+            maxLength: MAX_IDENTIFIER_CHARS,
+            pattern: SERVICE_IDENTIFIER_PATTERN.source,
+          })),
         };
         if (scopeKeys.length > 1) {
           parameters.scope = Type.Optional(
             stringEnum(scopeKeys, {
-              description: "Optional memory boundary to delete from",
+              description: "Memory boundary; required when deleting by ID",
             }),
           );
         }
@@ -587,45 +731,109 @@ const redisMemoryPlugin: PluginDefinition = {
             describeScopes(plan.toolScopes, plan.defaultStoreScope),
           parameters: Type.Object(parameters as Record<string, any>),
           async execute(_toolCallId, params) {
-            const { query, memoryId, scope: scopeKey } = params as {
+            const input =
+              params && typeof params === "object" && !Array.isArray(params)
+                ? params as Record<string, unknown>
+                : {};
+            const { query, memoryId, scope: scopeKey } = input as {
               query?: string;
               memoryId?: string;
               scope?: string;
             };
 
             try {
+              if (query !== undefined) assertSearchText(query, "query");
+              if (memoryId !== undefined) assertServiceIdentifier(memoryId, "memoryId");
+              if (scopeKey !== undefined && typeof scopeKey !== "string") {
+                throw new Error("scope must be a string");
+              }
+              if (memoryId && scopeKeys.length > 1 && !scopeKey) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: "Choose a scope before deleting a memory by ID.",
+                    },
+                  ],
+                  details: { action: "scope_required", id: memoryId },
+                };
+              }
+
               const targetScopes = scopeKey
                 ? [resolveSelectedScope(scopeKey, plan.toolScopes, plan.defaultStoreScope)]
                 : plan.toolScopes;
 
               if (memoryId) {
-                let lastError: unknown;
-                for (const scope of targetScopes) {
-                  try {
-                    await provider.deleteLongTerm([memoryId], {
-                      namespace: scope.namespace,
-                    });
-                    return {
-                      content: [
-                        {
-                          type: "text",
-                          text: `Memory ${memoryId} forgotten from ${scope.label}.`,
-                        },
-                      ],
-                      details: { action: "deleted", id: memoryId, scope: scope.key },
-                    };
-                  } catch (err) {
-                    lastError = err;
-                  }
+                const [scope] = targetScopes;
+                const outcome = await provider.deleteLongTerm([memoryId], {
+                  key: scope.key,
+                  namespace: scope.namespace,
+                  userId: scope.userId,
+                });
+
+                if (outcome.deletedIds.includes(memoryId)) {
+                  api.logger.info?.(
+                    `redis-memory: forget action=deleted id=${JSON.stringify(memoryId)} scope=${JSON.stringify(scope.key)}`,
+                  );
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Memory ${memoryId} forgotten from ${scope.label}.`,
+                      },
+                    ],
+                    details: { action: "deleted", id: memoryId, scope: scope.key },
+                  };
                 }
 
-                throw lastError ?? new Error(`Memory ${memoryId} not found`);
+                if (outcome.forbiddenIds.includes(memoryId)) {
+                  api.logger.warn(
+                    `redis-memory: forget action=forbidden id=${JSON.stringify(memoryId)} scope=${JSON.stringify(scope.key)}`,
+                  );
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Memory ${memoryId} is outside the selected scope.`,
+                      },
+                    ],
+                    details: { action: "forbidden", id: memoryId, scope: scope.key },
+                  };
+                }
+
+                if (outcome.notFoundIds.includes(memoryId)) {
+                  api.logger.info?.(
+                    `redis-memory: forget action=not_found id=${JSON.stringify(memoryId)} scope=${JSON.stringify(scope.key)}`,
+                  );
+                  return {
+                    content: [{ type: "text", text: `Memory ${memoryId} was not found.` }],
+                    details: { action: "not_found", id: memoryId, scope: scope.key },
+                  };
+                }
+
+                api.logger.warn(
+                  `redis-memory: forget action=failed id=${JSON.stringify(memoryId)} scope=${JSON.stringify(scope.key)}`,
+                );
+                return {
+                  content: [{ type: "text", text: `Memory ${memoryId} could not be deleted.` }],
+                  details: { action: "failed", id: memoryId, scope: scope.key },
+                };
               }
 
               if (query) {
+                const forgetBudget = Math.min(
+                  MAX_RECALL_LIMIT,
+                  Math.max(5, targetScopes.length),
+                );
+                const quotas = distributeBudget(forgetBudget, targetScopes.length);
+                const searchableScopes = targetScopes
+                  .map((scope, index) => ({ scope, limit: quotas[index] }))
+                  .filter((entry) => entry.limit > 0);
                 const flattened = (
-                  await Promise.all(
-                    targetScopes.map((scope) => searchScope(scope, query, 5)),
+                  await mapWithConcurrency(
+                    searchableScopes,
+                    MAX_SCOPED_SEARCH_CONCURRENCY,
+                    ({ scope, limit }) => searchScope(scope, query, limit),
                   )
                 ).flat();
                 // Same scoreless stable-order rule as memory_recall: never
@@ -635,8 +843,8 @@ const redisMemoryPlugin: PluginDefinition = {
                 const merged = showScores
                   ? flattened.sort(
                       (left, right) => (right.score ?? 0) - (left.score ?? 0),
-                    )
-                  : flattened;
+                    ).slice(0, MAX_RECALL_LIMIT)
+                  : flattened.slice(0, MAX_RECALL_LIMIT);
 
                 if (merged.length === 0) {
                   return {
@@ -645,25 +853,50 @@ const redisMemoryPlugin: PluginDefinition = {
                   };
                 }
 
-                // For scoreless providers (RAM) the server-side
-                // similarityThreshold already ran, so "exactly one hit" IS the
-                // high-confidence signal. Score-bearing providers (AMS) keep
-                // the >0.9 gate to avoid auto-deleting a weak single match.
-                if (
-                  merged.length === 1 &&
-                  (!showScores || (merged[0].score ?? 0) > 0.9)
-                ) {
+                // Only an actual score can justify automatic query deletion.
+                // Scoreless RAM results always require exact-ID confirmation.
+                if (merged.length === 1 && showScores && (merged[0].score ?? 0) > 0.9) {
                   const winningScope = targetScopes.find(
                     (scope) => scope.key === merged[0].scope,
                   ) ?? plan.defaultStoreScope;
-                  await provider.deleteLongTerm([merged[0].id], {
+                  const outcome = await provider.deleteLongTerm([merged[0].id], {
+                    key: winningScope.key,
                     namespace: winningScope.namespace,
+                    userId: winningScope.userId,
                   });
+
+                  if (!outcome.deletedIds.includes(merged[0].id)) {
+                    const action = outcome.forbiddenIds.includes(merged[0].id)
+                      ? "forbidden"
+                      : outcome.notFoundIds.includes(merged[0].id)
+                        ? "not_found"
+                        : "failed";
+                    api.logger.warn(
+                      `redis-memory: forget action=${action} id=${JSON.stringify(merged[0].id)} scope=${JSON.stringify(winningScope.key)}`,
+                    );
+                    return {
+                      content: [
+                        {
+                          type: "text",
+                          text: `Memory ${merged[0].id} could not be deleted from ${winningScope.label}.`,
+                        },
+                      ],
+                      details: {
+                        action,
+                        id: merged[0].id,
+                        scope: winningScope.key,
+                      },
+                    };
+                  }
+
+                  api.logger.info?.(
+                    `redis-memory: forget action=deleted id=${JSON.stringify(merged[0].id)} scope=${JSON.stringify(winningScope.key)}`,
+                  );
                   return {
                     content: [
                       {
                         type: "text",
-                        text: `Forgotten from ${winningScope.label}: "${merged[0].text}"`,
+                        text: `Forgotten from ${winningScope.label}: "${truncateVisibleText(merged[0].text, MAX_TOOL_RECORD_TEXT_CHARS)}"`,
                       },
                     ],
                     details: {
@@ -674,26 +907,28 @@ const redisMemoryPlugin: PluginDefinition = {
                   };
                 }
 
-                const list = merged
-                  .map((result) => {
-                    const scopeLabel = result.scopeLabel ?? result.scope ?? "unknown";
-                    return `- [${result.id.slice(0, 8)}] [${scopeLabel}] ${result.text.slice(0, 60)}...`;
-                  })
-                  .join("\n");
-
-                const candidates = merged.map((result) => ({
+                const candidates = boundToolMemories(merged).map((result) => ({
                   id: result.id,
                   text: result.text,
                   score: result.score,
                   scope: result.scope,
                   scopeLabel: result.scopeLabel,
                 }));
+                const list = candidates
+                  .map((result) => {
+                    const scopeLabel = result.scopeLabel ?? result.scope ?? "unknown";
+                    return `- [${result.id.slice(0, 8)}] [${scopeLabel}] ${result.text.slice(0, 60)}...`;
+                  })
+                  .join("\n");
 
                 return {
                   content: [
                     {
                       type: "text",
-                      text: `Found ${merged.length} candidates. Specify memoryId${scopeKeys.length > 1 ? " and optional scope" : ""}:\n${list}`,
+                      text: truncateVisibleText(
+                        `Found ${candidates.length} candidates. Specify memoryId${scopeKeys.length > 1 ? " and scope" : ""}:\n${list}`,
+                        MAX_TOOL_OUTPUT_CHARS,
+                      ),
                     },
                   ],
                   details: { action: "candidates", candidates },
@@ -705,10 +940,10 @@ const redisMemoryPlugin: PluginDefinition = {
                 details: { error: "missing_param" },
               };
             } catch (err) {
-              api.logger.warn(`redis-memory: forget failed: ${String(err)}`);
+              reportFailure("forget", err);
               return {
-                content: [{ type: "text", text: `Memory forget failed: ${String(err)}` }],
-                details: { error: String(err) },
+                content: [{ type: "text", text: "Memory forget failed." }],
+                details: { error: "backend_error" },
               };
             }
           },
@@ -717,11 +952,108 @@ const redisMemoryPlugin: PluginDefinition = {
       { name: "memory_forget" },
     );
 
+    api.registerTool(
+      (toolCtx) => {
+        const plan = getToolPlan({
+          agentId: toolCtx.agentId,
+          sessionKey: toolCtx.sessionKey,
+        });
+        const scopeKeys = plan.toolScopes.map((scope) => scope.key);
+        return {
+          name: "memory_erase_scope",
+          label: "Memory Scope Erasure",
+          description:
+            "Perform the strongest backend-supported best-effort erasure for one authorized memory scope. " +
+            "This does not certify deletion from backups, external writers, or upstream retention systems.",
+          parameters: Type.Object({
+            scope: stringEnum(scopeKeys, {
+              description: "Exact authorized memory scope to erase",
+            }),
+            confirm: Type.String({
+              description: 'Must exactly equal "ERASE <scope>"',
+              minLength: 7,
+              maxLength: MAX_IDENTIFIER_CHARS + 6,
+            }),
+          }),
+          async execute(_toolCallId, params) {
+            const input = params && typeof params === "object" && !Array.isArray(params)
+              ? params as Record<string, unknown>
+              : {};
+            const scopeKey = typeof input.scope === "string" ? input.scope : undefined;
+            const confirm = typeof input.confirm === "string" ? input.confirm : undefined;
+            if (!scopeKey || !scopeKeys.includes(scopeKey)) {
+              return {
+                content: [{ type: "text", text: "Choose an authorized scope to erase." }],
+                details: { status: "failed", residuals: ["scope_not_authorized"] },
+              };
+            }
+            if (confirm !== `ERASE ${scopeKey}`) {
+              return {
+                content: [{ type: "text", text: `Confirmation must exactly match ERASE ${scopeKey}.` }],
+                details: { status: "failed", scope: scopeKey, residuals: ["confirmation_required"] },
+              };
+            }
+
+            const scope = resolveSelectedScope(scopeKey, plan.toolScopes, plan.defaultStoreScope);
+            erasingScopes.add(scope.key);
+            try {
+              const drained = await captureCoordinator.waitForScope(scope.key, 5_000);
+              if (!drained) {
+                api.logger.warn(
+                  `redis-memory: erasure status=failed scope=${JSON.stringify(scope.key)} reason=capture_drain_timeout`,
+                );
+                return {
+                  content: [{ type: "text", text: `Erasure did not start for ${scope.label}; capture did not quiesce.` }],
+                  details: {
+                    status: "failed",
+                    scope: scope.key,
+                    residuals: ["capture_drain_timeout"],
+                  },
+                };
+              }
+
+              const result = await provider.eraseScope(
+                { key: scope.key, namespace: scope.namespace, userId: scope.userId },
+                { settleMs: cfg.erasureSettleMs, maxRecords: 10_000 },
+              );
+              api.logger.info?.(
+                `redis-memory: erasure status=${result.status} scope=${JSON.stringify(scope.key)} ` +
+                `memory_ids=${result.memoryIds.length} session_ids=${result.sessionIds.length} ` +
+                `failed_memory_ids=${result.failedMemoryIds.length} failed_session_ids=${result.failedSessionIds.length}`,
+              );
+              return {
+                content: [{
+                  type: "text",
+                  text:
+                    `Scope erasure status: ${result.status}. ` +
+                    `Long-term records found: ${result.memoryIds.length}; sessions found: ${result.sessionIds.length}; ` +
+                    `remaining: ${result.remainingMemoryIds.length + result.remainingSessionIds.length}.`,
+                }],
+                details: result,
+              };
+            } catch {
+              api.logger.warn(
+                `redis-memory: erasure status=failed scope=${JSON.stringify(scope.key)} reason=backend_error`,
+              );
+              return {
+                content: [{ type: "text", text: `Scope erasure failed for ${scope.label}.` }],
+                details: { status: "failed", scope: scope.key, residuals: ["backend_error"] },
+              };
+            } finally {
+              erasingScopes.delete(scope.key);
+            }
+          },
+        };
+      },
+      { name: "memory_erase_scope" },
+    );
+
     // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 
-    // Auto-recall: inject rolling summary + query-specific memories before prompt build
+    // Auto-recall: inject rolling summary + query-specific memories as one
+    // structurally encoded, explicitly untrusted data envelope.
     if (cfg.autoRecall) {
       api.on("before_prompt_build", async (event, ctx) => {
         const e = event as { prompt?: string };
@@ -733,77 +1065,93 @@ const redisMemoryPlugin: PluginDefinition = {
           sessionKey,
         });
 
-        for (const scope of plan.captureScopes) {
-          const workingMemorySessionId = getWorkingMemorySessionId(sessionKey, scope);
-          const trackingKey = buildTrackingKey(scope, workingMemorySessionId);
-          try {
-            const checkpoint = await provider.getCaptureCheckpoint(workingMemorySessionId, {
-              namespace: scope.namespace,
-              userId: scope.userId,
-            });
-            if (checkpoint > 0) {
-              sessionMaxTimestamps.set(trackingKey, checkpoint);
-            } else {
-              sessionMaxTimestamps.delete(trackingKey);
-            }
-          } catch {
-            sessionMaxTimestamps.delete(trackingKey);
-          }
-        }
-
-        const contextParts: string[] = [];
-
-        const searchQuery = stripEnvelopeForSearch(e.prompt);
-        for (const scope of plan.recallScopes) {
-          const scopedContextParts: string[] = [];
-
-          if (provider.capabilities.summaryViews && provider.summaries) {
-            const part = await provider.summaries.getSummaryPartition(scope);
-            if (part) {
-              scopedContextParts.push(
-                `<user-summary computed="${part.computedAt ?? "unknown"}" memories="${part.memoryCount}">\n${part.summary}\n</user-summary>`,
-              );
-              api.logger.info?.(
-                `redis-memory: injecting summary for scope "${scope.key}" (${part.memoryCount} memories)`,
-              );
-            }
-          }
-
-          if (searchQuery && searchQuery.length >= 5) {
-            try {
-              const filtered = await searchScope(scope, searchQuery, cfg.recallLimit ?? 3);
-              if (filtered.length > 0) {
-                const memoryList = filtered.map((memory) => `- ${memory.text}`).join("\n");
-                scopedContextParts.push(
-                  `<relevant-memories query-specific="true">\n${memoryList}\n</relevant-memories>`,
+        const enabledScopes = plan.recallScopes.filter((scope) => scope.autoRecall);
+        const records: UntrustedMemoryRecord[] = [];
+        const searchQuery = stripEnvelopeForSearch(e.prompt).slice(0, MAX_SEARCH_TEXT_CHARS);
+        const recordBudget = Math.min(
+          MAX_RECALL_LIMIT,
+          enabledScopes.length + (cfg.recallLimit ?? 3),
+        );
+        if (provider.capabilities.summaryViews && provider.summaries) {
+          const summaries = await mapWithConcurrency(
+            enabledScopes,
+            MAX_SCOPED_SEARCH_CONCURRENCY,
+            async (scope) => {
+              try {
+                const part = await provider.summaries!.getSummaryPartition(scope);
+                if (part) {
+                  api.logger.info?.(
+                    `redis-memory: recalled summary scope=${JSON.stringify(scope.key)} memories=${part.memoryCount}`,
+                  );
+                }
+                return part
+                  ? {
+                      kind: "summary" as const,
+                      scope: scope.key,
+                      id: `summary-${scope.key}`,
+                      memoryType: "aggregate",
+                      source: "summary-view",
+                      content: part.summary,
+                    }
+                  : undefined;
+              } catch (err) {
+                api.logger.warn(
+                  `redis-memory: summary recall failed scope=${JSON.stringify(scope.key)}: ${safeErrorMessage(err, sensitiveValues)}`,
                 );
-                api.logger.info?.(
-                  `redis-memory: injecting ${filtered.length} query-specific memories for scope "${scope.key}"`,
-                );
+                return undefined;
               }
-            } catch (err) {
-              api.logger.warn(
-                `redis-memory: semantic search failed for scope "${scope.key}": ${String(err)}`,
-              );
-            }
-          }
-
-          if (scopedContextParts.length === 0) continue;
-
-          if (plan.recallScopes.length > 1) {
-            contextParts.push(
-              `<memory-scope key="${scope.key}" label="${scope.label}">\n${scopedContextParts.join("\n\n")}\n</memory-scope>`,
-            );
-          } else {
-            contextParts.push(scopedContextParts.join("\n\n"));
-          }
+            },
+          );
+          records.push(
+            ...summaries.flatMap((record) => record ? [record] : [])
+              .slice(0, recordBudget),
+          );
         }
 
-        if (contextParts.length === 0) return;
-
-        return {
-          prependContext: contextParts.join("\n\n"),
-        };
+        const semanticBudget = Math.max(0, recordBudget - records.length);
+        if (searchQuery && searchQuery.length >= 5 && semanticBudget > 0) {
+          const quotas = distributeBudget(semanticBudget, enabledScopes.length);
+          const searchableScopes = enabledScopes
+            .map((scope, index) => ({
+              scope,
+              limit: Math.min(cfg.recallLimit ?? 3, quotas[index]),
+            }))
+            .filter((entry) => entry.limit > 0);
+          const recalled = await mapWithConcurrency(
+            searchableScopes,
+            MAX_SCOPED_SEARCH_CONCURRENCY,
+            async ({ scope, limit }) => {
+              try {
+                const filtered = await searchScope(scope, searchQuery, limit);
+                if (filtered.length > 0) {
+                  api.logger.info?.(
+                    `redis-memory: recalled memories scope=${JSON.stringify(scope.key)} count=${filtered.length}`,
+                  );
+                }
+                return filtered.map((memory) => ({
+                  kind: "memory" as const,
+                  scope: scope.key,
+                  id: memory.id,
+                  memoryType: memory.memoryType,
+                  source: memory.source ?? "unknown",
+                  content: memory.text,
+                }));
+              } catch (err) {
+                api.logger.warn(
+                  `redis-memory: semantic search failed for scope "${scope.key}": ${safeErrorMessage(err, sensitiveValues)}`,
+                );
+                return [];
+              }
+            },
+          );
+          records.push(...recalled.flat().slice(0, semanticBudget));
+        }
+        const prependContext = frameUntrustedMemories(records, {
+          maxRecords: recordBudget,
+          maxRecordChars: cfg.recallRecordMaxChars,
+          maxTotalChars: cfg.recallContextMaxChars,
+        });
+        return prependContext ? { prependContext } : undefined;
       });
     }
 
@@ -829,32 +1177,35 @@ const redisMemoryPlugin: PluginDefinition = {
           }
 
           for (const scope of plan.captureScopes) {
+            if (!scope.autoCapture || erasingScopes.has(scope.key)) continue;
+            const memoryMessages = applyCapturePrivacy(allMemoryMessages, {
+              assistantCapture: scope.assistantCapture,
+              sensitiveDataRedaction: scope.sensitiveDataRedaction,
+            });
+            if (memoryMessages.length === 0) continue;
             const workingMemorySessionId = getWorkingMemorySessionId(sessionKey, scope);
             const trackingKey = buildTrackingKey(scope, workingMemorySessionId);
-            const cutoffTs = sessionMaxTimestamps.get(trackingKey) ?? 0;
-            const newMessages = allMemoryMessages.filter(
-              (message) => message.timestampMs > cutoffTs,
-            );
-
-            sessionMaxTimestamps.delete(trackingKey);
-
-            if (newMessages.length === 0) {
-              continue;
-            }
-
-            await provider.captureMessages(workingMemorySessionId, newMessages, {
-              namespace: scope.namespace,
-              userId: scope.userId,
-              extractionStrategy: scope.extractionStrategy,
-              customPrompt: scope.customPrompt,
+            const result = await captureCoordinator.capture({
+              trackingKey,
+              sessionId: workingMemorySessionId,
+              messages: memoryMessages,
+              scope: {
+                key: scope.key,
+                namespace: scope.namespace,
+                userId: scope.userId,
+                extractionStrategy: scope.extractionStrategy,
+                customPrompt: scope.customPrompt,
+                sessionRetentionSeconds: scope.sessionRetentionSeconds,
+              },
+              canWrite: () => !erasingScopes.has(scope.key),
             });
 
-            if (provider.capabilities.summaryViews) {
+            if (result.acceptedMessageIds.length > 0 && provider.capabilities.summaryViews) {
               await provider.summaries?.refreshView(scope);
             }
           }
         } catch (err) {
-          api.logger.warn(`redis-memory: capture failed: ${String(err)}`);
+          reportFailure("capture", err);
         }
       });
     }
@@ -869,7 +1220,7 @@ const redisMemoryPlugin: PluginDefinition = {
         try {
           await provider.healthCheck();
           api.logger.info?.(
-            `redis-memory: connected to server (${cfg.serverUrl}, namespace: ${cfg.namespace ?? "default"})`,
+            `redis-memory: connected to server (${cfg.serverUrl}, namespace: ${JSON.stringify(cfg.namespace ?? "default")})`,
           );
 
           if (provider.capabilities.summaryViews) {
@@ -879,11 +1230,12 @@ const redisMemoryPlugin: PluginDefinition = {
           }
         } catch (err) {
           api.logger.warn(
-            `redis-memory: server not reachable at ${cfg.serverUrl}: ${String(err)}`,
+            `redis-memory: server not reachable at ${cfg.serverUrl}: ${safeErrorMessage(err, sensitiveValues)}`,
           );
         }
       },
-      stop: () => {
+      stop: async () => {
+        await captureCoordinator.drain(5000);
         api.logger.info?.("redis-memory: stopped");
       },
     });

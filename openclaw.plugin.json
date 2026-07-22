@@ -62,6 +62,36 @@
       "label": "Auto-Recall",
       "help": "Automatically inject relevant memories into context"
     },
+    "assistantCapture": {
+      "label": "Assistant Capture",
+      "help": "Include assistant turns for memory extraction, or exclude them to minimize retained data",
+      "advanced": true
+    },
+    "sensitiveDataRedaction": {
+      "label": "Sensitive Data Redaction",
+      "help": "Apply opt-in heuristic redaction for common secrets and personal identifiers before capture",
+      "advanced": true
+    },
+    "sessionRetentionSeconds": {
+      "label": "Session Retention (seconds)",
+      "help": "Self-hosted working-memory TTL. Not supported by Redis Agent Memory cloud.",
+      "advanced": true
+    },
+    "recallRecordMaxChars": {
+      "label": "Recall Record Limit",
+      "help": "Maximum characters from one record in automatic recall context",
+      "advanced": true
+    },
+    "recallContextMaxChars": {
+      "label": "Recall Context Limit",
+      "help": "Maximum characters in the complete automatic recall envelope",
+      "advanced": true
+    },
+    "erasureSettleMs": {
+      "label": "Erasure Settle Delay",
+      "help": "Delay between best-effort erasure sweeps",
+      "advanced": true
+    },
     "minScore": {
       "label": "Minimum Score",
       "placeholder": "0.3",
@@ -118,7 +148,7 @@
     },
     "forgetDescription": {
       "label": "Forget Tool Description",
-      "placeholder": "Delete specific memories. GDPR-compliant.",
+      "placeholder": "Delete a specific memory from an authorized scope.",
       "help": "Description shown to the LLM for the memory_forget tool",
       "advanced": true
     },
@@ -138,49 +168,63 @@
     "additionalProperties": false,
     "properties": {
       "provider": { "type": "string", "enum": ["cloud", "self-hosted"] },
-      "serverUrl": { "type": "string" },
-      "apiKey": { "type": "string" },
-      "bearerToken": { "type": "string" },
-      "storeId": { "type": "string" },
-      "namespace": { "type": "string" },
-      "userId": { "type": "string" },
-      "workingMemorySessionId": { "type": "string" },
-      "timeout": { "type": "number" },
+      "serverUrl": { "type": "string", "minLength": 1, "maxLength": 2048, "format": "uri" },
+      "apiKey": { "type": "string", "minLength": 1, "maxLength": 4096 },
+      "bearerToken": { "type": "string", "minLength": 1, "maxLength": 8192 },
+      "storeId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9-]+$" },
+      "namespace": { "type": "string", "minLength": 1, "maxLength": 255 },
+      "userId": { "type": "string", "minLength": 1, "maxLength": 255 },
+      "workingMemorySessionId": { "type": "string", "minLength": 1, "maxLength": 255 },
+      "timeout": { "type": "integer", "minimum": 100, "maximum": 120000 },
       "autoCapture": { "type": "boolean" },
       "autoRecall": { "type": "boolean" },
+      "assistantCapture": { "type": "string", "enum": ["exclude", "include"] },
+      "sensitiveDataRedaction": { "type": "boolean" },
+      "sessionRetentionSeconds": { "type": "integer", "minimum": 60, "maximum": 31536000 },
+      "recallRecordMaxChars": { "type": "integer", "minimum": 128, "maximum": 10000 },
+      "recallContextMaxChars": { "type": "integer", "minimum": 1024, "maximum": 32000 },
+      "erasureSettleMs": { "type": "integer", "minimum": 0, "maximum": 60000 },
       "minScore": { "type": "number", "minimum": 0, "maximum": 1 },
-      "recallLimit": { "type": "number", "minimum": 1 },
+      "recallLimit": { "type": "integer", "minimum": 1, "maximum": 100 },
       "extractionStrategy": {
         "type": "string",
         "enum": ["discrete", "summary", "preferences", "custom"]
       },
-      "customPrompt": { "type": "string" },
-      "summaryViewName": { "type": "string" },
-      "summaryTimeWindowDays": { "type": "number", "minimum": 1 },
+      "customPrompt": { "type": "string", "minLength": 1, "maxLength": 20000 },
+      "summaryViewName": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+      "summaryTimeWindowDays": { "type": "integer", "minimum": 1, "maximum": 36500 },
       "summaryGroupBy": {
         "type": "array",
         "items": { "type": "string", "enum": ["user_id", "namespace"] }
       },
-      "recallDescription": { "type": "string" },
-      "storeDescription": { "type": "string" },
-      "forgetDescription": { "type": "string" },
+      "recallDescription": { "type": "string", "minLength": 1, "maxLength": 4000 },
+      "storeDescription": { "type": "string", "minLength": 1, "maxLength": 4000 },
+      "forgetDescription": { "type": "string", "minLength": 1, "maxLength": 4000 },
       "scopes": {
         "type": "object",
+        "minProperties": 1,
+        "maxProperties": 32,
+        "propertyNames": { "pattern": "^[A-Za-z0-9_-]{1,64}$" },
         "additionalProperties": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "label": { "type": "string" },
-            "namespace": { "type": "string" },
-            "userId": { "type": "string" },
-            "workingMemorySessionId": { "type": "string" },
+            "label": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "namespace": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "userId": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "workingMemorySessionId": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "autoRecall": { "type": "boolean" },
+            "autoCapture": { "type": "boolean" },
+            "assistantCapture": { "type": "string", "enum": ["exclude", "include"] },
+            "sensitiveDataRedaction": { "type": "boolean" },
+            "sessionRetentionSeconds": { "type": "integer", "minimum": 60, "maximum": 31536000 },
             "extractionStrategy": {
               "type": "string",
               "enum": ["discrete", "summary", "preferences", "custom"]
             },
-            "customPrompt": { "type": "string" },
-            "summaryViewName": { "type": "string" },
-            "summaryTimeWindowDays": { "type": "number", "minimum": 1 },
+            "customPrompt": { "type": "string", "minLength": 1, "maxLength": 20000 },
+            "summaryViewName": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+            "summaryTimeWindowDays": { "type": "integer", "minimum": 1, "maximum": 36500 },
             "summaryGroupBy": {
               "type": "array",
               "items": { "type": "string", "enum": ["user_id", "namespace"] }
@@ -190,24 +234,30 @@
       },
       "agentScopes": {
         "type": "object",
+        "minProperties": 1,
+        "maxProperties": 128,
+        "propertyNames": { "pattern": "^[A-Za-z0-9_-]{1,64}$" },
         "additionalProperties": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "primaryScope": { "type": "string" },
+            "primaryScope": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" },
             "recallScopes": {
               "type": "array",
-              "items": { "type": "string" }
+              "maxItems": 32,
+              "items": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }
             },
             "captureScopes": {
               "type": "array",
-              "items": { "type": "string" }
+              "maxItems": 32,
+              "items": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }
             },
             "toolScopes": {
               "type": "array",
-              "items": { "type": "string" }
+              "maxItems": 32,
+              "items": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }
             },
-            "defaultStoreScope": { "type": "string" }
+            "defaultStoreScope": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }
           },
           "required": ["primaryScope"]
         }

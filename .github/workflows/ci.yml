@@ -6,9 +6,21 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint GitHub Actions workflows
+        run: docker run --rm -v "$PWD/.github/workflows:/workflows:ro" rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 /workflows/ci.yml /workflows/release-gate.yml /workflows/release.yml
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     strategy:
       matrix:
@@ -32,8 +44,16 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Test packed package as a consumer
+        run: npm run test:package
+
+      - name: Audit production and development dependencies
+        if: matrix.node-version == 22
+        run: npm audit --audit-level=high
+
   integration-cloud:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # The cloud integration suite self-skips when the AGENT_MEMORY_* secrets are
     # unset (e.g. on fork PRs, where secrets are empty), so this job is safe to
     # run unconditionally — it just becomes a no-op that reports skipped tests.

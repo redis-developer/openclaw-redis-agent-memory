@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   searchLongTermMemory: vi.fn(),
   createLongTermMemory: vi.fn(),
   deleteLongTermMemories: vi.fn(),
+  getLongTermMemory: vi.fn(),
   getWorkingMemory: vi.fn(),
   putWorkingMemory: vi.fn(),
   healthCheck: vi.fn(),
@@ -25,6 +26,8 @@ const mocks = vi.hoisted(() => ({
   createSummaryView: vi.fn(),
   runSummaryView: vi.fn(),
   listSummaryViewPartitions: vi.fn(),
+  listSessions: vi.fn(),
+  deleteWorkingMemory: vi.fn(),
 }));
 
 vi.mock("agent-memory-client", () => {
@@ -32,6 +35,7 @@ vi.mock("agent-memory-client", () => {
     searchLongTermMemory = mocks.searchLongTermMemory;
     createLongTermMemory = mocks.createLongTermMemory;
     deleteLongTermMemories = mocks.deleteLongTermMemories;
+    getLongTermMemory = mocks.getLongTermMemory;
     getWorkingMemory = mocks.getWorkingMemory;
     putWorkingMemory = mocks.putWorkingMemory;
     healthCheck = mocks.healthCheck;
@@ -39,6 +43,8 @@ vi.mock("agent-memory-client", () => {
     createSummaryView = mocks.createSummaryView;
     runSummaryView = mocks.runSummaryView;
     listSummaryViewPartitions = mocks.listSummaryViewPartitions;
+    listSessions = mocks.listSessions;
+    deleteWorkingMemory = mocks.deleteWorkingMemory;
     constructor(_config: unknown) {}
   }
   class MemoryNotFoundError extends Error {}
@@ -73,6 +79,21 @@ describe("createAmsProvider", () => {
     await expect(provider.healthCheck()).resolves.toBeUndefined();
   });
 
+  test("eraseScope fails closed without a filter-only long-term list API", async () => {
+    const provider = createAmsProvider(cfg);
+    const result = await provider.eraseScope(
+      { key: "personal", namespace: "ns", userId: "alice" },
+      { settleMs: 0, maxRecords: 100 },
+    );
+    expect(result.status).toBe("failed");
+    expect(result.passes).toBe(0);
+    expect(result.residuals).toContain("long_term_enumeration_not_supported");
+    expect(mocks.searchLongTermMemory).not.toHaveBeenCalled();
+    expect(mocks.deleteLongTermMemories).not.toHaveBeenCalled();
+    expect(mocks.listSessions).not.toHaveBeenCalled();
+    expect(mocks.deleteWorkingMemory).not.toHaveBeenCalled();
+  });
+
   // --------------------------------------------------------------------
   // searchLongTerm: distanceThreshold + dist->score + post-filter
   // --------------------------------------------------------------------
@@ -80,8 +101,8 @@ describe("createAmsProvider", () => {
   test("translates minScore to distanceThreshold and maps dist to score", async () => {
     mocks.searchLongTermMemory.mockResolvedValue({
       memories: [
-        { id: "a", text: "alpha", dist: 0.1, topics: ["t1"], entities: ["e1"] },
-        { id: "b", text: "beta", dist: 0.2 },
+        { id: "a", text: "alpha", dist: 0.1, topics: ["t1"], entities: ["e1"], namespace: "ns", user_id: "u" },
+        { id: "b", text: "beta", dist: 0.2, namespace: "ns", user_id: "u", session_id: "session-1", memory_type: "semantic" },
       ],
       total: 2,
     });
@@ -111,6 +132,28 @@ describe("createAmsProvider", () => {
     expect(results[1].score).toBeCloseTo(0.8); // 1 - 0.2
     expect(results[1].topics).toBeUndefined();
     expect(results[1].entities).toBeUndefined();
+    expect(results[1].memoryType).toBe("semantic");
+    expect(results[1].source).toBe("session");
+  });
+
+  test("drops cross-user, cross-namespace, and identity-missing search results", async () => {
+    mocks.searchLongTermMemory.mockResolvedValue({
+      memories: [
+        { id: "ok", text: "safe", dist: 0.1, namespace: "ns", user_id: "alice" },
+        { id: "user", text: "hostile-user", dist: 0.1, namespace: "ns", user_id: "mallory" },
+        { id: "namespace", text: "hostile-namespace", dist: 0.1, namespace: "other", user_id: "alice" },
+        { id: "missing", text: "hostile-missing", dist: 0.1 },
+      ],
+      total: 4,
+    });
+    const provider = createAmsProvider(cfg);
+    const results = await provider.searchLongTerm({
+      text: "query",
+      limit: 10,
+      namespace: "ns",
+      userId: "alice",
+    });
+    expect(results.map((result) => result.id)).toEqual(["ok"]);
   });
 
   test("omits namespace/userId filters when not provided and distanceThreshold when minScore unset", async () => {
@@ -233,32 +276,109 @@ describe("createAmsProvider", () => {
     });
   });
 
+  test("createLongTerm accepts omitted optional topics", async () => {
+    mocks.createLongTermMemory.mockResolvedValue({ status: "ok" });
+    const provider = createAmsProvider(cfg);
+    await expect(provider.createLongTerm({ text: "valid" })).resolves.toMatchObject({
+      id: expect.any(String),
+    });
+  });
+
   // --------------------------------------------------------------------
   // deleteLongTerm
   // --------------------------------------------------------------------
 
-  test("deleteLongTerm forwards ids and namespace", async () => {
+  test("deleteLongTerm authorizes exact namespace and user before deleting", async () => {
+    mocks.getLongTermMemory.mockResolvedValue({
+      id: "x",
+      text: "private",
+      namespace: "ns",
+      user_id: "alice",
+    });
     mocks.deleteLongTermMemories.mockResolvedValue({ status: "ok" });
     const provider = createAmsProvider(cfg);
-    await provider.deleteLongTerm(["x", "y"], { namespace: "ns" });
-    expect(mocks.deleteLongTermMemories).toHaveBeenCalledWith(["x", "y"], { namespace: "ns" });
+    const result = await provider.deleteLongTerm(["x"], {
+      key: "personal",
+      namespace: "ns",
+      userId: "alice",
+    });
+
+    expect(result.deletedIds).toEqual(["x"]);
+    expect(mocks.getLongTermMemory).toHaveBeenCalledWith("x", { namespace: "ns" });
+    expect(mocks.deleteLongTermMemories).toHaveBeenCalledWith(["x"], { namespace: "ns" });
+  });
+
+  test.each([
+    ["missing namespace", { id: "x", text: "private", user_id: "alice" }],
+    ["wrong namespace", { id: "x", text: "private", namespace: "other", user_id: "alice" }],
+    ["missing user", { id: "x", text: "private", namespace: "ns" }],
+    ["wrong user", { id: "x", text: "private", namespace: "ns", user_id: "bob" }],
+  ])("deleteLongTerm denies %s without deleting", async (_label, memory) => {
+    mocks.getLongTermMemory.mockResolvedValue(memory);
+    const provider = createAmsProvider(cfg);
+
+    const result = await provider.deleteLongTerm(["x"], {
+      key: "personal",
+      namespace: "ns",
+      userId: "alice",
+    });
+
+    expect(result.forbiddenIds).toEqual(["x"]);
+    expect(mocks.deleteLongTermMemories).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain("private");
+  });
+
+  test("deleteLongTerm distinguishes not-found records", async () => {
+    mocks.getLongTermMemory.mockResolvedValue(null);
+    const provider = createAmsProvider(cfg);
+
+    const result = await provider.deleteLongTerm(["gone"], { key: "default" });
+
+    expect(result.notFoundIds).toEqual(["gone"]);
+    expect(mocks.deleteLongTermMemories).not.toHaveBeenCalled();
+  });
+
+  test("deleteLongTerm records per-id backend failures after earlier success", async () => {
+    mocks.getLongTermMemory.mockImplementation(async (id: string) => ({
+      id,
+      text: id,
+      namespace: "ns",
+      user_id: "alice",
+    }));
+    mocks.deleteLongTermMemories
+      .mockResolvedValueOnce({ status: "ok" })
+      .mockRejectedValueOnce(new Error("backend failed"));
+    const provider = createAmsProvider(cfg);
+
+    const result = await provider.deleteLongTerm(["ok", "failed"], {
+      key: "personal",
+      namespace: "ns",
+      userId: "alice",
+    });
+
+    expect(result.deletedIds).toEqual(["ok"]);
+    expect(result.failedIds).toEqual(["failed"]);
   });
 
   // --------------------------------------------------------------------
   // getCaptureCheckpoint
   // --------------------------------------------------------------------
 
-  test("getCaptureCheckpoint returns the max created_at epoch ms", async () => {
+  test("getCaptureCheckpoint returns the max created_at and ids at that timestamp", async () => {
     mocks.getWorkingMemory.mockResolvedValue({
       messages: [
-        { role: "user", content: "a", created_at: new Date(1000).toISOString() },
-        { role: "user", content: "b", created_at: new Date(3000).toISOString() },
-        { role: "user", content: "c", created_at: new Date(2000).toISOString() },
+        { role: "user", content: "a", id: "old", created_at: new Date(1000).toISOString() },
+        { role: "user", content: "b", id: "max-a", created_at: new Date(3000).toISOString() },
+        { role: "user", content: "c", id: "middle", created_at: new Date(2000).toISOString() },
+        { role: "assistant", content: "d", id: "max-b", created_at: new Date(3000).toISOString() },
       ],
     });
 
     const provider = createAmsProvider(cfg);
-    expect(await provider.getCaptureCheckpoint("s", { namespace: "ns" })).toBe(3000);
+    expect(await provider.getCaptureCheckpoint("s", { namespace: "ns" })).toEqual({
+      maxTimestampMs: 3000,
+      messageIdsAtMax: ["max-a", "max-b"],
+    });
     expect(mocks.getWorkingMemory).toHaveBeenCalledWith("s", { namespace: "ns" });
   });
 
@@ -266,10 +386,16 @@ describe("createAmsProvider", () => {
     const provider = createAmsProvider(cfg);
 
     mocks.getWorkingMemory.mockResolvedValueOnce(null);
-    expect(await provider.getCaptureCheckpoint("s", {})).toBe(0);
+    expect(await provider.getCaptureCheckpoint("s", {})).toEqual({
+      maxTimestampMs: 0,
+      messageIdsAtMax: [],
+    });
 
     mocks.getWorkingMemory.mockResolvedValueOnce({ messages: [] });
-    expect(await provider.getCaptureCheckpoint("s", {})).toBe(0);
+    expect(await provider.getCaptureCheckpoint("s", {})).toEqual({
+      maxTimestampMs: 0,
+      messageIdsAtMax: [],
+    });
   });
 
   // --------------------------------------------------------------------
@@ -328,4 +454,28 @@ describe("createAmsProvider", () => {
     const [, wm] = mocks.putWorkingMemory.mock.calls[0];
     expect(wm.long_term_memory_strategy).toBeUndefined();
   });
+
+  test("captureMessages forwards the configured self-hosted session TTL", async () => {
+    mocks.putWorkingMemory.mockResolvedValue({});
+    const provider = createAmsProvider(cfg);
+    await provider.captureMessages(
+      "s",
+      [{ role: "user", content: "c", id: "m", timestampMs: 1 }],
+      { sessionRetentionSeconds: 3_600 },
+    );
+    expect(mocks.putWorkingMemory.mock.calls[0][1].ttl_seconds).toBe(3_600);
+  });
+
+  test.each([-1, 1.5, Number.NaN, 8_640_000_000_000_001])(
+    "captureMessages rejects invalid timestamp %s before transport",
+    async (timestampMs) => {
+      const provider = createAmsProvider(cfg);
+      await expect(provider.captureMessages(
+        "session-1",
+        [{ role: "user", content: "valid", id: "m1", timestampMs }],
+        {},
+      )).rejects.toThrow(/valid nonnegative Unix timestamp/);
+      expect(mocks.putWorkingMemory).not.toHaveBeenCalled();
+    },
+  );
 });
