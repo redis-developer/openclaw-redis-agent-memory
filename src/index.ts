@@ -1052,9 +1052,18 @@ const redisMemoryPlugin: PluginDefinition = {
     // Lifecycle Hooks
     // ========================================================================
 
+    // Named scopes may opt into auto-recall/-capture even when the top-level
+    // default is off, so register each hook when the global flag OR any
+    // configured scope enables it; the per-scope flag inside each hook stays
+    // the authoritative switch. For legacy single-scope configs the scope
+    // inherits the global flag, so this is a no-op there.
+    const configuredScopes = getConfiguredScopes(cfg);
+    const anyScopeAutoRecall = configuredScopes.some((scope) => scope.autoRecall);
+    const anyScopeAutoCapture = configuredScopes.some((scope) => scope.autoCapture);
+
     // Auto-recall: inject rolling summary + query-specific memories as one
     // structurally encoded, explicitly untrusted data envelope.
-    if (cfg.autoRecall) {
+    if (cfg.autoRecall || anyScopeAutoRecall) {
       api.on("before_prompt_build", async (event, ctx) => {
         const e = event as { prompt?: string };
         if (!e.prompt || e.prompt.length < 5) return;
@@ -1156,7 +1165,7 @@ const redisMemoryPlugin: PluginDefinition = {
     }
 
     // Auto-capture: save conversation to working memory for background extraction
-    if (cfg.autoCapture) {
+    if (cfg.autoCapture || anyScopeAutoCapture) {
       api.on("agent_end", async (event, ctx) => {
         const e = event as { success?: boolean; messages?: unknown[] };
 

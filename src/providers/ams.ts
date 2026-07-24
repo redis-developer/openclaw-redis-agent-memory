@@ -402,9 +402,19 @@ export function createAmsProvider(
       });
 
       if (!Array.isArray(existing.memories)) throw new Error("AMS search response is invalid");
-      if (existing.memories.length > 0 && existing.memories[0].dist < 0.05) {
-        assertAmsMemory(existing.memories[0]);
-        return { id: existing.memories[0].id, text: existing.memories[0].text };
+      const match = existing.memories[0];
+      if (match && match.dist < 0.05) {
+        assertAmsMemory(match);
+        // Re-verify scope client-side like searchLongTerm/deleteLongTerm, rather
+        // than trusting the server filter, so a record from another
+        // namespace/user is never surfaced (and echoed back by memory_store) as
+        // a duplicate.
+        if (
+          normalizeOptionalString(match.namespace) === namespace &&
+          normalizeOptionalString(match.user_id) === userId
+        ) {
+          return { id: match.id, text: match.text };
+        }
       }
       return null;
     },

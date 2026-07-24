@@ -41,13 +41,6 @@ import {
   assertTopics,
 } from "../validation.js";
 
-/**
- * `storeId` is being added to `MemoryConfig` by a parallel story
- * (config.ts is owned by another agent while this one is in flight). Cast
- * locally rather than editing config.ts here.
- */
-type CloudConfig = MemoryConfig & { storeId?: string };
-
 const RAM_ID_DIGEST_LENGTH = 58;
 export const RAM_ERASURE_CONCURRENCY = 4;
 
@@ -160,12 +153,11 @@ export function createRamProvider(
   cfg: MemoryConfig,
   logger?: PluginLogger,
 ): MemoryProvider {
-  const cloudCfg = cfg as CloudConfig;
   const client = new RamSdkAdapter({
-    serverUrl: cloudCfg.serverUrl,
-    apiKey: cloudCfg.apiKey!,
-    storeId: cloudCfg.storeId!,
-    timeoutMs: cloudCfg.timeout,
+    serverUrl: cfg.serverUrl,
+    apiKey: cfg.apiKey!,
+    storeId: cfg.storeId!,
+    timeoutMs: cfg.timeout,
   });
 
   async function enumerateMemoryIds(
@@ -469,6 +461,24 @@ export function createRamProvider(
         residuals.add("verification_failed");
       }
 
+      // Reconcile the failure sets against the authoritative re-enumeration: an
+      // id proven absent by verification is not a failure, even if an earlier
+      // bulk-delete response omitted it from `deleted` (the adapter tolerates
+      // such omissions). Mirrors the session 404 self-heal so a fully-erased
+      // scope reports "verified_best_effort" instead of a spurious "partial".
+      // Only runs when verification succeeded, so a failed re-enumeration never
+      // clears a genuine failure.
+      if (!residuals.has("verification_failed")) {
+        const remainingMemory = new Set(remainingMemoryIds);
+        for (const id of [...failedMemoryIds]) {
+          if (!remainingMemory.has(id)) failedMemoryIds.delete(id);
+        }
+        const remainingSession = new Set(remainingSessionIds);
+        for (const id of [...failedSessionIds]) {
+          if (!remainingSession.has(id)) failedSessionIds.delete(id);
+        }
+      }
+
       const hasFailure = failedMemoryIds.size > 0 || failedSessionIds.size > 0 ||
         remainingMemoryIds.length > 0 || remainingSessionIds.length > 0 ||
         residuals.has("enumeration_failed_closed") || residuals.has("verification_failed");
@@ -498,11 +508,14 @@ export function createRamProvider(
         filter: buildFilter(key, namespace, userId),
       });
 
-      if (response.items.length > 0) {
-        const [match] = response.items;
-        return { id: match.id, text: match.text };
-      }
-      return null;
+      // Re-verify the owner boundary client-side, exactly like searchLongTerm:
+      // the server-side ownerId filter is treated as untrusted, so a record
+      // outside this scope's derived owner must never be surfaced (and echoed
+      // back to the model by memory_store) as a duplicate.
+      const match = response.items.find((memory) =>
+        isAuthorizedRamMemory(memory, { key: key ?? "default", namespace, userId }),
+      );
+      return match ? { id: match.id, text: match.text } : null;
     },
 
     async getCaptureCheckpoint(sessionId, _scope) {

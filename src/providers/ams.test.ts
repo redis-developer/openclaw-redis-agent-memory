@@ -201,7 +201,7 @@ describe("createAmsProvider", () => {
 
   test("findDuplicate treats dist 0.049 as a duplicate", async () => {
     mocks.searchLongTermMemory.mockResolvedValue({
-      memories: [{ id: "d1", text: "dup", dist: 0.049 }],
+      memories: [{ id: "d1", text: "dup", dist: 0.049, namespace: "ns", user_id: "u" }],
       total: 1,
     });
 
@@ -231,6 +231,16 @@ describe("createAmsProvider", () => {
     mocks.searchLongTermMemory.mockResolvedValue({ memories: [], total: 0 });
     const provider = createAmsProvider(cfg);
     expect(await provider.findDuplicate({ text: "x" })).toBeNull();
+  });
+
+  test("findDuplicate drops a near-match from another namespace/user", async () => {
+    mocks.searchLongTermMemory.mockResolvedValue({
+      memories: [{ id: "d1", text: "someone else's secret", dist: 0.01, namespace: "ns", user_id: "attacker" }],
+      total: 1,
+    });
+    const provider = createAmsProvider(cfg);
+    const dup = await provider.findDuplicate({ text: "x", namespace: "ns", userId: "u" });
+    expect(dup).toBeNull();
   });
 
   // --------------------------------------------------------------------

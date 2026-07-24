@@ -54,15 +54,18 @@ jobs:
   integration-cloud:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # The cloud integration suite self-skips when the AGENT_MEMORY_* secrets are
-    # unset (e.g. on fork PRs, where secrets are empty), so this job is safe to
-    # run unconditionally — it just becomes a no-op that reports skipped tests.
-    # A single global concurrency group serializes runs so two PRs never
-    # interleave writes into the shared cloud store (Story 06's unique-namespace
-    # isolation is the primary defense; this is belt-and-braces).
-    concurrency:
-      group: ram-cloud-integration
-      cancel-in-progress: false
+    # PUBLIC-REPO SAFETY: this PR-triggered job must NEVER receive the live RAM
+    # credentials. Live cloud coverage runs post-merge in release-gate.yml
+    # (push:main + weekly schedule + workflow_dispatch), gated by the protected
+    # `ram-release` GitHub Environment. Here we run the integration suite with no
+    # AGENT_MEMORY_* secrets in the environment: it self-skips (see the env gate
+    # in src/ram/integration.test.ts), makes zero network calls, and exposes
+    # nothing, while still proving the suite compiles and collects.
+    #
+    # Do NOT add secrets.AGENT_MEMORY_* to this job. On the `pull_request` event
+    # a same-repo branch PR (any collaborator) would receive them with no
+    # approval gate. Route any credentialed PR-time run through a separate
+    # environment-gated, maintainer-approved workflow instead.
     steps:
       - uses: actions/checkout@v4
 
@@ -78,9 +81,5 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Cloud integration tests
-        env:
-          AGENT_MEMORY_ENDPOINT: ${{ secrets.AGENT_MEMORY_ENDPOINT }}
-          AGENT_MEMORY_API_KEY: ${{ secrets.AGENT_MEMORY_API_KEY }}
-          AGENT_MEMORY_STORE_ID: ${{ secrets.AGENT_MEMORY_STORE_ID }}
+      - name: Cloud integration tests (credential-free; live coverage runs in release-gate on merge)
         run: npm run test:integration

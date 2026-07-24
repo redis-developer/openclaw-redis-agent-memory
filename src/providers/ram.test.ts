@@ -309,7 +309,13 @@ describe("createRamProvider", () => {
 
   test("findDuplicate searches with similarityThreshold 0.95 and limit 1, applying the same filters", async () => {
     mocks.searchLongTermMemory.mockResolvedValue({
-      items: [{ id: "d1", text: "dup", createdAt: new Date(1), updatedAt: new Date(1) }],
+      items: [{
+        id: "d1",
+        text: "dup",
+        ownerId: deriveRamOwnerId("ns", "u", "personal"),
+        createdAt: new Date(1),
+        updatedAt: new Date(1),
+      }],
     });
 
     const provider = createRamProvider(cfg);
@@ -326,6 +332,21 @@ describe("createRamProvider", () => {
     mocks.searchLongTermMemory.mockResolvedValue({ items: [] });
     const provider = createRamProvider(cfg);
     expect(await provider.findDuplicate({ text: "x" })).toBeNull();
+  });
+
+  test("findDuplicate drops a record outside the scope's owner boundary", async () => {
+    mocks.searchLongTermMemory.mockResolvedValue({
+      items: [{
+        id: "other-scope",
+        text: "someone else's secret",
+        ownerId: deriveRamOwnerId("ns", "attacker", "personal"),
+        createdAt: new Date(1),
+        updatedAt: new Date(1),
+      }],
+    });
+    const provider = createRamProvider(cfg);
+    const dup = await provider.findDuplicate({ text: "x", key: "personal", namespace: "ns", userId: "u" });
+    expect(dup).toBeNull();
   });
 
   // --------------------------------------------------------------------
