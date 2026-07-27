@@ -1,6 +1,9 @@
 {
   "id": "openclaw-redis-agent-memory",
   "kind": "memory",
+  "contracts": {
+    "tools": ["memory_recall", "memory_store", "memory_forget", "memory_erase_scope"]
+  },
   "uiHints": {
     "provider": {
       "label": "Backend",
