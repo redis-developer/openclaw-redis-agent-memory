@@ -6,9 +6,21 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint GitHub Actions workflows
+        run: docker run --rm -v "$PWD/.github/workflows:/workflows:ro" rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 /workflows/ci.yml /workflows/release-gate.yml /workflows/release.yml
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     strategy:
       matrix:
@@ -32,3 +44,42 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Test packed package as a consumer
+        run: npm run test:package
+
+      - name: Audit production and development dependencies
+        if: matrix.node-version == 22
+        run: npm audit --audit-level=high
+
+  integration-cloud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # PUBLIC-REPO SAFETY: this PR-triggered job must NEVER receive the live RAM
+    # credentials. Live cloud coverage runs post-merge in release-gate.yml
+    # (push:main + weekly schedule + workflow_dispatch), gated by the protected
+    # `ram-release` GitHub Environment. Here we run the integration suite with no
+    # AGENT_MEMORY_* secrets in the environment: it self-skips (see the env gate
+    # in src/ram/integration.test.ts), makes zero network calls, and exposes
+    # nothing, while still proving the suite compiles and collects.
+    #
+    # Do NOT add secrets.AGENT_MEMORY_* to this job. On the `pull_request` event
+    # a same-repo branch PR (any collaborator) would receive them with no
+    # approval gate. Route any credentialed PR-time run through a separate
+    # environment-gated, maintainer-approved workflow instead.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Cloud integration tests (credential-free; live coverage runs in release-gate on merge)
+        run: npm run test:integration

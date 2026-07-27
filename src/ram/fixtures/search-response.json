@@ -1,0 +1,12 @@
+{
+  "items": [
+    {
+      "id": "memory-1",
+      "text": "Redis is fast",
+      "topics": ["redis"],
+      "createdAt": "2026-07-21T12:00:00.000Z",
+      "updatedAt": "2026-07-21T12:01:00.000Z"
+    }
+  ],
+  "nextPageToken": "next-1"
+}

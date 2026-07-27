@@ -1,24 +1,40 @@
 {
   "id": "openclaw-redis-agent-memory",
   "kind": "memory",
+  "contracts": {
+    "tools": ["memory_recall", "memory_store", "memory_forget", "memory_erase_scope"]
+  },
   "uiHints": {
+    "provider": {
+      "label": "Backend",
+      "help": "Which backend to use. Defaults to \"cloud\" (Redis Agent Memory) unless an existing self-hosted config is detected.",
+      "options": [
+        { "value": "cloud", "label": "Redis Agent Memory (cloud, default)" },
+        { "value": "self-hosted", "label": "Self-hosted agent-memory-server" }
+      ]
+    },
     "serverUrl": {
       "label": "Server URL",
       "placeholder": "http://localhost:8000",
-      "help": "Base URL of the agent-memory-server (or use ${AGENT_MEMORY_SERVER_URL})"
+      "help": "Base URL of the backend: the Redis Agent Memory cloud endpoint (falls back to ${AGENT_MEMORY_ENDPOINT}) when using the cloud provider, or the self-hosted agent-memory-server URL otherwise."
     },
     "apiKey": {
       "label": "API Key",
       "sensitive": true,
       "placeholder": "your-api-key",
-      "help": "API key for authentication (optional, or use ${AGENT_MEMORY_API_KEY})"
+      "help": "API key for authentication. Required for the cloud provider (sent as the Redis Agent Memory bearer token; falls back to ${AGENT_MEMORY_API_KEY}). Optional for self-hosted."
     },
     "bearerToken": {
       "label": "Bearer Token",
       "sensitive": true,
       "placeholder": "your-bearer-token",
-      "help": "Bearer token for authentication (optional)",
+      "help": "Bearer token for authentication (self-hosted only; optional). Not supported with the cloud provider — use API Key instead.",
       "advanced": true
+    },
+    "storeId": {
+      "label": "Store ID",
+      "placeholder": "your-store-id",
+      "help": "Redis Agent Memory store id (cloud provider only, or use ${AGENT_MEMORY_STORE_ID})"
     },
     "namespace": {
       "label": "Namespace",
@@ -48,6 +64,36 @@
     "autoRecall": {
       "label": "Auto-Recall",
       "help": "Automatically inject relevant memories into context"
+    },
+    "assistantCapture": {
+      "label": "Assistant Capture",
+      "help": "Include assistant turns for memory extraction, or exclude them to minimize retained data",
+      "advanced": true
+    },
+    "sensitiveDataRedaction": {
+      "label": "Sensitive Data Redaction",
+      "help": "Apply opt-in heuristic redaction for common secrets and personal identifiers before capture",
+      "advanced": true
+    },
+    "sessionRetentionSeconds": {
+      "label": "Session Retention (seconds)",
+      "help": "Self-hosted working-memory TTL. Not supported by Redis Agent Memory cloud.",
+      "advanced": true
+    },
+    "recallRecordMaxChars": {
+      "label": "Recall Record Limit",
+      "help": "Maximum characters from one record in automatic recall context",
+      "advanced": true
+    },
+    "recallContextMaxChars": {
+      "label": "Recall Context Limit",
+      "help": "Maximum characters in the complete automatic recall envelope",
+      "advanced": true
+    },
+    "erasureSettleMs": {
+      "label": "Erasure Settle Delay",
+      "help": "Delay between best-effort erasure sweeps",
+      "advanced": true
     },
     "minScore": {
       "label": "Minimum Score",
@@ -105,7 +151,7 @@
     },
     "forgetDescription": {
       "label": "Forget Tool Description",
-      "placeholder": "Delete specific memories. GDPR-compliant.",
+      "placeholder": "Delete a specific memory from an authorized scope.",
       "help": "Description shown to the LLM for the memory_forget tool",
       "advanced": true
     },
@@ -124,48 +170,64 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "serverUrl": { "type": "string" },
-      "apiKey": { "type": "string" },
-      "bearerToken": { "type": "string" },
-      "namespace": { "type": "string" },
-      "userId": { "type": "string" },
-      "workingMemorySessionId": { "type": "string" },
-      "timeout": { "type": "number" },
+      "provider": { "type": "string", "enum": ["cloud", "self-hosted"] },
+      "serverUrl": { "type": "string", "minLength": 1, "maxLength": 2048, "format": "uri" },
+      "apiKey": { "type": "string", "minLength": 1, "maxLength": 4096 },
+      "bearerToken": { "type": "string", "minLength": 1, "maxLength": 8192 },
+      "storeId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9-]+$" },
+      "namespace": { "type": "string", "minLength": 1, "maxLength": 255 },
+      "userId": { "type": "string", "minLength": 1, "maxLength": 255 },
+      "workingMemorySessionId": { "type": "string", "minLength": 1, "maxLength": 255 },
+      "timeout": { "type": "integer", "minimum": 100, "maximum": 120000 },
       "autoCapture": { "type": "boolean" },
       "autoRecall": { "type": "boolean" },
+      "assistantCapture": { "type": "string", "enum": ["exclude", "include"] },
+      "sensitiveDataRedaction": { "type": "boolean" },
+      "sessionRetentionSeconds": { "type": "integer", "minimum": 60, "maximum": 31536000 },
+      "recallRecordMaxChars": { "type": "integer", "minimum": 128, "maximum": 10000 },
+      "recallContextMaxChars": { "type": "integer", "minimum": 1024, "maximum": 32000 },
+      "erasureSettleMs": { "type": "integer", "minimum": 0, "maximum": 60000 },
       "minScore": { "type": "number", "minimum": 0, "maximum": 1 },
-      "recallLimit": { "type": "number", "minimum": 1 },
+      "recallLimit": { "type": "integer", "minimum": 1, "maximum": 100 },
       "extractionStrategy": {
         "type": "string",
         "enum": ["discrete", "summary", "preferences", "custom"]
       },
-      "customPrompt": { "type": "string" },
-      "summaryViewName": { "type": "string" },
-      "summaryTimeWindowDays": { "type": "number", "minimum": 1 },
+      "customPrompt": { "type": "string", "minLength": 1, "maxLength": 20000 },
+      "summaryViewName": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+      "summaryTimeWindowDays": { "type": "integer", "minimum": 1, "maximum": 36500 },
       "summaryGroupBy": {
         "type": "array",
         "items": { "type": "string", "enum": ["user_id", "namespace"] }
       },
-      "recallDescription": { "type": "string" },
-      "storeDescription": { "type": "string" },
-      "forgetDescription": { "type": "string" },
+      "recallDescription": { "type": "string", "minLength": 1, "maxLength": 4000 },
+      "storeDescription": { "type": "string", "minLength": 1, "maxLength": 4000 },
+      "forgetDescription": { "type": "string", "minLength": 1, "maxLength": 4000 },
       "scopes": {
         "type": "object",
+        "minProperties": 1,
+        "maxProperties": 32,
+        "propertyNames": { "pattern": "^[A-Za-z0-9_-]{1,64}$" },
         "additionalProperties": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "label": { "type": "string" },
-            "namespace": { "type": "string" },
-            "userId": { "type": "string" },
-            "workingMemorySessionId": { "type": "string" },
+            "label": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "namespace": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "userId": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "workingMemorySessionId": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "autoRecall": { "type": "boolean" },
+            "autoCapture": { "type": "boolean" },
+            "assistantCapture": { "type": "string", "enum": ["exclude", "include"] },
+            "sensitiveDataRedaction": { "type": "boolean" },
+            "sessionRetentionSeconds": { "type": "integer", "minimum": 60, "maximum": 31536000 },
             "extractionStrategy": {
               "type": "string",
               "enum": ["discrete", "summary", "preferences", "custom"]
             },
-            "customPrompt": { "type": "string" },
-            "summaryViewName": { "type": "string" },
-            "summaryTimeWindowDays": { "type": "number", "minimum": 1 },
+            "customPrompt": { "type": "string", "minLength": 1, "maxLength": 20000 },
+            "summaryViewName": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+            "summaryTimeWindowDays": { "type": "integer", "minimum": 1, "maximum": 36500 },
             "summaryGroupBy": {
               "type": "array",
               "items": { "type": "string", "enum": ["user_id", "namespace"] }
@@ -175,24 +237,30 @@
       },
       "agentScopes": {
         "type": "object",
+        "minProperties": 1,
+        "maxProperties": 128,
+        "propertyNames": { "pattern": "^[A-Za-z0-9_-]{1,64}$" },
         "additionalProperties": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "primaryScope": { "type": "string" },
+            "primaryScope": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" },
             "recallScopes": {
               "type": "array",
-              "items": { "type": "string" }
+              "maxItems": 32,
+              "items": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }
             },
             "captureScopes": {
               "type": "array",
-              "items": { "type": "string" }
+              "maxItems": 32,
+              "items": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }
             },
             "toolScopes": {
               "type": "array",
-              "items": { "type": "string" }
+              "maxItems": 32,
+              "items": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }
             },
-            "defaultStoreScope": { "type": "string" }
+            "defaultStoreScope": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }
           },
           "required": ["primaryScope"]
         }

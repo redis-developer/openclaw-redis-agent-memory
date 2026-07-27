@@ -5,6 +5,7 @@ import type {
   SummaryGroupByField,
   AgentMemoryRoute,
 } from "./config.js";
+import type { AssistantCapturePolicy } from "./privacy.js";
 
 export type ScopedMemoryTarget = {
   key: string;
@@ -17,6 +18,11 @@ export type ScopedMemoryTarget = {
   summaryViewName: string;
   summaryTimeWindowDays: number;
   summaryGroupBy: SummaryGroupByField[];
+  autoRecall: boolean;
+  autoCapture: boolean;
+  assistantCapture: AssistantCapturePolicy;
+  sensitiveDataRedaction: boolean;
+  sessionRetentionSeconds?: number;
 };
 
 export type AgentScopePlan = {
@@ -66,6 +72,11 @@ function buildLegacyScope(cfg: MemoryConfig): ScopedMemoryTarget {
     summaryViewName: cfg.summaryViewName!,
     summaryTimeWindowDays: cfg.summaryTimeWindowDays!,
     summaryGroupBy: cfg.summaryGroupBy!,
+    autoRecall: cfg.autoRecall!,
+    autoCapture: cfg.autoCapture!,
+    assistantCapture: cfg.assistantCapture,
+    sensitiveDataRedaction: cfg.sensitiveDataRedaction,
+    sessionRetentionSeconds: cfg.sessionRetentionSeconds,
   };
 }
 
@@ -81,6 +92,11 @@ function buildScopedTarget(key: string, scope: MemoryScopeConfig): ScopedMemoryT
     summaryViewName: scope.summaryViewName!,
     summaryTimeWindowDays: scope.summaryTimeWindowDays!,
     summaryGroupBy: scope.summaryGroupBy!,
+    autoRecall: scope.autoRecall!,
+    autoCapture: scope.autoCapture!,
+    assistantCapture: scope.assistantCapture!,
+    sensitiveDataRedaction: scope.sensitiveDataRedaction!,
+    sessionRetentionSeconds: scope.sessionRetentionSeconds,
   };
 }
 
