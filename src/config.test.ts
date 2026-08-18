@@ -9,7 +9,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
-import { parseMemoryConfig } from "./config.js";
+import { ALLOWED_CONFIG_KEYS, parseMemoryConfig } from "./config.js";
 
 const ENV_KEYS = [
   "AGENT_MEMORY_ENDPOINT",
@@ -110,6 +110,15 @@ describe("parseMemoryConfig — provider resolution", () => {
       sensitiveDataRedaction: false,
       sessionRetentionSeconds: 600,
     });
+  });
+
+  test("manifest configSchema stays in lockstep with parser-accepted keys", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const manifest = JSON.parse(
+      await readFile(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    );
+    const manifestKeys = Object.keys(manifest.configSchema.properties).sort();
+    expect(manifestKeys).toEqual([...ALLOWED_CONFIG_KEYS].sort());
   });
 
   test("eagerStartupCheck defaults to true and accepts false", () => {

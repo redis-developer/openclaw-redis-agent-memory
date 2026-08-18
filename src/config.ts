@@ -477,7 +477,13 @@ function parseAgentMemoryRoute(key: string, value: unknown): AgentMemoryRoute {
   };
 }
 
-const ALLOWED_CONFIG_KEYS = [
+/**
+ * Every key parseMemoryConfig accepts. Exported so tests can assert the
+ * plugin-manifest configSchema stays in lockstep: the gateway validates
+ * config against the manifest before the plugin loads, so a key accepted
+ * here but missing there fails gateway startup.
+ */
+export const ALLOWED_CONFIG_KEYS = [
   "provider",
   "serverUrl",
   "apiKey",
