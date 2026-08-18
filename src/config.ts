@@ -128,6 +128,14 @@ export type MemoryConfig = {
   assistantCapture: AssistantCapturePolicy;
   /** Apply best-effort sensitive-data pattern redaction before capture. */
   sensitiveDataRedaction: boolean;
+  /**
+   * Await the backend health check (and summary-view ensures) during service
+   * start (default: true). When false they run in the background so hosts
+   * that gate readiness on service start are not blocked by the network
+   * round-trips; failures still surface as log warnings and per-call tool
+   * errors.
+   */
+  eagerStartupCheck: boolean;
   /** Self-hosted working-memory TTL. Unsupported by RAM cloud. */
   sessionRetentionSeconds?: number;
   /** Delay between destructive erasure sweeps. */
@@ -487,6 +495,7 @@ const ALLOWED_CONFIG_KEYS = [
   "recallContextMaxChars",
   "assistantCapture",
   "sensitiveDataRedaction",
+  "eagerStartupCheck",
   "sessionRetentionSeconds",
   "erasureSettleMs",
   "extractionStrategy",
@@ -530,7 +539,12 @@ const NUMBER_CONFIG_KEYS = [
   "sessionRetentionSeconds",
   "erasureSettleMs",
 ] as const;
-const BOOLEAN_CONFIG_KEYS = ["autoCapture", "autoRecall", "sensitiveDataRedaction"] as const;
+const BOOLEAN_CONFIG_KEYS = [
+  "autoCapture",
+  "autoRecall",
+  "sensitiveDataRedaction",
+  "eagerStartupCheck",
+] as const;
 
 function assertConfigFieldTypes(cfg: Record<string, unknown>): void {
   for (const key of STRING_CONFIG_KEYS) {
@@ -637,6 +651,7 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
   );
   const autoCapture = cfg.autoCapture !== false;
   const autoRecall = cfg.autoRecall !== false;
+  const eagerStartupCheck = cfg.eagerStartupCheck !== false;
   const assistantCapture =
     cfg.assistantCapture === "exclude" ? "exclude" : "include";
   const sensitiveDataRedaction = cfg.sensitiveDataRedaction === true;
@@ -949,6 +964,7 @@ export function parseMemoryConfig(value: unknown): MemoryConfig {
     recallContextMaxChars,
     assistantCapture,
     sensitiveDataRedaction,
+    eagerStartupCheck,
     sessionRetentionSeconds,
     erasureSettleMs,
     extractionStrategy,
@@ -1030,6 +1046,11 @@ export const memoryConfigSchema = {
     autoRecall: {
       label: "Auto-Recall",
       help: "Automatically inject relevant memories into context",
+    },
+    eagerStartupCheck: {
+      label: "Eager Startup Check",
+      help: "Await the backend health check during service start. Disable on latency-sensitive hosts to run it in the background instead",
+      advanced: true,
     },
     assistantCapture: {
       label: "Assistant Capture",

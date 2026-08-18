@@ -1223,24 +1223,37 @@ const redisMemoryPlugin: PluginDefinition = {
     // Service
     // ========================================================================
 
+    // The health check and summary-view ensures are informational network
+    // round-trips: a failure has never blocked startup (it only warns), and
+    // every tool call handles provider errors on its own. With
+    // eagerStartupCheck=false they run in the background so hosts that gate
+    // readiness on service start (e.g. warm pools) are not delayed by them.
+    const verifyBackend = async () => {
+      try {
+        await provider.healthCheck();
+        api.logger.info?.(
+          `redis-memory: connected to server (${cfg.serverUrl}, namespace: ${JSON.stringify(cfg.namespace ?? "default")})`,
+        );
+
+        if (provider.capabilities.summaryViews) {
+          for (const scope of getConfiguredScopes(cfg)) {
+            await provider.summaries?.ensureView(scope);
+          }
+        }
+      } catch (err) {
+        api.logger.warn(
+          `redis-memory: server not reachable at ${cfg.serverUrl}: ${safeErrorMessage(err, sensitiveValues)}`,
+        );
+      }
+    };
+
     api.registerService({
       id: "redis-memory",
       start: async () => {
-        try {
-          await provider.healthCheck();
-          api.logger.info?.(
-            `redis-memory: connected to server (${cfg.serverUrl}, namespace: ${JSON.stringify(cfg.namespace ?? "default")})`,
-          );
-
-          if (provider.capabilities.summaryViews) {
-            for (const scope of getConfiguredScopes(cfg)) {
-              await provider.summaries?.ensureView(scope);
-            }
-          }
-        } catch (err) {
-          api.logger.warn(
-            `redis-memory: server not reachable at ${cfg.serverUrl}: ${safeErrorMessage(err, sensitiveValues)}`,
-          );
+        if (cfg.eagerStartupCheck) {
+          await verifyBackend();
+        } else {
+          void verifyBackend();
         }
       },
       stop: async () => {

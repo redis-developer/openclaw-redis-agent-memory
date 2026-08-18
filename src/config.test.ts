@@ -112,9 +112,18 @@ describe("parseMemoryConfig — provider resolution", () => {
     });
   });
 
+  test("eagerStartupCheck defaults to true and accepts false", () => {
+    expect(parseMemoryConfig({ serverUrl: "http://localhost:8000" }).eagerStartupCheck).toBe(true);
+    expect(
+      parseMemoryConfig({ serverUrl: "http://localhost:8000", eagerStartupCheck: false })
+        .eagerStartupCheck,
+    ).toBe(false);
+  });
+
   test.each([
     [{ assistantCapture: "sometimes" }, /assistantCapture must be exclude or include/],
     [{ sensitiveDataRedaction: "yes" }, /sensitiveDataRedaction must be a boolean/],
+    [{ eagerStartupCheck: "yes" }, /eagerStartupCheck must be a boolean/],
     [{ sessionRetentionSeconds: 59 }, /sessionRetentionSeconds must be between 60/],
     [{ recallRecordMaxChars: 127 }, /recallRecordMaxChars must be between 128/],
     [{ recallContextMaxChars: 1000 }, /recallContextMaxChars must be between 1024/],

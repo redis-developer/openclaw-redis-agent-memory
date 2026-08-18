@@ -755,6 +755,43 @@ describe("redis-memory plugin — provider integration (Story 05)", () => {
     expect(logs.all.join("\n")).not.toContain("super-secret-key");
   });
 
+  test("service start awaits the health check by default", async () => {
+    const healthCheck = vi.fn(async () => {});
+    const provider = createFakeProvider({ healthCheck });
+    const { services } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+
+    await services[0].start();
+
+    expect(healthCheck).toHaveBeenCalledTimes(1);
+  });
+
+  test("eagerStartupCheck=false: service start returns while the health check is still pending", async () => {
+    let releaseHealthCheck!: () => void;
+    const healthGate = new Promise<void>((resolve) => {
+      releaseHealthCheck = resolve;
+    });
+    const healthCheck = vi.fn(async () => {
+      await healthGate;
+    });
+    const provider = createFakeProvider({ healthCheck });
+    const { services, logs } = await registerWithFakeProvider(
+      { ...SELF_HOSTED_CONFIG, eagerStartupCheck: false },
+      provider,
+    );
+
+    // Resolves immediately even though the health check is gated open; an
+    // awaited check would hang this call (and time the test out).
+    await services[0].start();
+    expect(healthCheck).toHaveBeenCalledTimes(1);
+    expect(logs.info.some((l) => l.includes("connected to server"))).toBe(false);
+
+    // The background check still completes and logs once released.
+    releaseHealthCheck();
+    await vi.waitFor(() =>
+      expect(logs.info.some((l) => l.includes("connected to server"))).toBe(true),
+    );
+  });
+
   test("self-hosted config logs 'backend: self-hosted' (no storeId)", async () => {
     const provider = createFakeProvider({
       capabilities: { summaryViews: true, extractionStrategy: true, similarityScores: true },
