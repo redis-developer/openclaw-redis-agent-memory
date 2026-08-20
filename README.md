@@ -312,6 +312,7 @@ When multiple scopes are available, the manual memory tools expose a `scope` par
 | `recallRecordMaxChars` | integer | `2000` | Maximum characters from one record in automatic recall, from 128 through 10000 |
 | `recallContextMaxChars` | integer | `16000` | Maximum characters in the complete automatic recall envelope, from 1024 through 32000 |
 | `erasureSettleMs` | integer | `2000` | Delay between best-effort scope-erasure sweeps, from 0 through 60000 milliseconds |
+| `eagerStartupCheck` | boolean | `true` | Await the backend health check (and self-hosted summary-view setup) during service start. Set `false` on latency-sensitive hosts to run it in the background instead: startup returns immediately and failures still appear as log warnings. |
 | `extractionStrategy` | string | server default | **Self-hosted only.** `discrete`, `summary`, `preferences`, or `custom`; ignored on cloud (logged once at startup) |
 | `customPrompt` | string | unset | **Self-hosted only.** Custom extraction prompt for `custom` strategy |
 | `summaryViewName` | string | `agent_user_summary` | **Self-hosted only.** Summary view name for rolling memory summaries |

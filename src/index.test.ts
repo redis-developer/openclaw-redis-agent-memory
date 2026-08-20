@@ -792,6 +792,67 @@ describe("redis-memory plugin — provider integration (Story 05)", () => {
     );
   });
 
+  test("eagerStartupCheck=false: stop() waits for the in-flight verification", async () => {
+    let releaseHealthCheck!: () => void;
+    const healthGate = new Promise<void>((resolve) => {
+      releaseHealthCheck = resolve;
+    });
+    let healthCheckSettled = false;
+    const healthCheck = vi.fn(async () => {
+      await healthGate;
+      healthCheckSettled = true;
+    });
+    const provider = createFakeProvider({ healthCheck });
+    const { services } = await registerWithFakeProvider(
+      { ...SELF_HOSTED_CONFIG, eagerStartupCheck: false },
+      provider,
+    );
+
+    await services[0].start();
+    expect(healthCheckSettled).toBe(false);
+
+    // stop() must not resolve while verification is still in flight, otherwise
+    // an ensureView could write during teardown and log after "stopped".
+    let stopped = false;
+    const stopping = services[0].stop().then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+
+    releaseHealthCheck();
+    await stopping;
+    expect(healthCheckSettled).toBe(true);
+  });
+
+  test("eagerStartupCheck=false: a throwing logger does not escape as an unhandled rejection", async () => {
+    const provider = createFakeProvider({
+      healthCheck: vi.fn(async () => {
+        throw new Error("backend down");
+      }),
+    });
+    const { api, services } = await registerWithFakeProvider(
+      { ...SELF_HOSTED_CONFIG, eagerStartupCheck: false },
+      provider,
+    );
+    // The warn path inside verifyBackend's own catch block throws.
+    api.logger.warn = () => {
+      throw new Error("logger exploded");
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      await expect(services[0].start()).resolves.toBeUndefined();
+      await services[0].stop();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   test("self-hosted config logs 'backend: self-hosted' (no storeId)", async () => {
     const provider = createFakeProvider({
       capabilities: { summaryViews: true, extractionStrategy: true, similarityScores: true },

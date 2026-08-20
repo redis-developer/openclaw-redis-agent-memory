@@ -1247,16 +1247,34 @@ const redisMemoryPlugin: PluginDefinition = {
       }
     };
 
+    // Tracked so a deferred verification cannot outlive the plugin: an
+    // in-flight ensureView would otherwise write during teardown, and its log
+    // line would land after "stopped".
+    let startupVerification: Promise<void> | undefined;
+
     api.registerService({
       id: "redis-memory",
       start: async () => {
+        // The .catch is belt and braces: verifyBackend already swallows
+        // provider errors, but a throw from the logger inside its own catch
+        // block would otherwise escape as an unhandled rejection, which is
+        // fatal under Node's default --unhandled-rejections=throw.
+        startupVerification = verifyBackend().catch(() => {});
         if (cfg.eagerStartupCheck) {
-          await verifyBackend();
-        } else {
-          void verifyBackend();
+          await startupVerification;
+          startupVerification = undefined;
         }
       },
       stop: async () => {
+        if (startupVerification) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timedOut = new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, 5000);
+          });
+          await Promise.race([startupVerification, timedOut]);
+          if (timer) clearTimeout(timer);
+          startupVerification = undefined;
+        }
         await captureCoordinator.drain(5000);
         api.logger.info?.("redis-memory: stopped");
       },
