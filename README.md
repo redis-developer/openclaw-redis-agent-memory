@@ -170,7 +170,7 @@ See the [full configuration reference](https://redis.github.io/agent-memory-serv
 Use a deterministic smoke test before building on top of the plugin. The tool calls below are identical regardless of backend.
 
 1. Start OpenClaw with the plugin enabled.
-2. Confirm the plugin can reach the backend. The OpenClaw logs should include a registration line naming the resolved backend, e.g. `redis-memory: plugin registered (backend: cloud, server: ..., storeId: ..., namespace: ...)` or `redis-memory: plugin registered (backend: self-hosted, server: ..., namespace: ...)`, followed by `redis-memory: connected to server (...)` once the health check succeeds.
+2. Confirm the plugin can reach the backend. The OpenClaw logs should include a registration line naming the resolved backend, e.g. `redis-memory: plugin registered (backend: cloud, server: ..., storeId: ..., namespace: ...)` or `redis-memory: plugin registered (backend: self-hosted, server: ..., namespace: ...)`, followed by `redis-memory: connected to server (...)` once the health check succeeds. With `eagerStartupCheck: false` that second line arrives shortly after startup instead of before it, since the check no longer blocks startup, so give it a moment when running this test.
 3. In a chat or tool playground, store a known fact:
 
 ```json
@@ -562,6 +562,7 @@ reconciles the remote checkpoint before retrying safe reads.
 
 - If config parsing fails with an error starting `Redis Agent Memory (cloud) is the default backend and requires serverUrl, apiKey, storeId...`, you're missing one or more cloud credentials. Either supply the missing config keys (or their `AGENT_MEMORY_*` env var fallbacks), or set `"provider": "self-hosted"` to use your own server instead.
 - If you see `server not reachable`, make sure the container is running (self-hosted) or that your cloud endpoint and credentials are correct, and that `serverUrl` matches the exposed port or cloud endpoint.
+- If you set `eagerStartupCheck: false` and see no `connected to server` line while the gateway starts, that is expected. The check runs in the background, so that line, or a `server not reachable` warning, appears shortly after startup rather than during it.
 - If auto-recall seems empty, verify that you are using the same `namespace` and `userId` across sessions.
 - **"Why don't I see summary context on cloud?"** Summary views are self-hosted only. The cloud backend has no summary-view equivalent, so `summaryViewName`, `summaryTimeWindowDays`, and `summaryGroupBy` are ignored there.
 - **"Why are there no percentages in my recall results?"** The cloud backend does not return a similarity score per result, so recall output omits the `(NN%)` suffix. Self-hosted always returns scores.
