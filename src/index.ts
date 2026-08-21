@@ -1259,7 +1259,7 @@ const redisMemoryPlugin: PluginDefinition = {
         // provider errors, but a throw from the logger inside its own catch
         // block would otherwise escape as an unhandled rejection, which is
         // fatal under Node's default --unhandled-rejections=throw.
-        startupVerification = verifyBackend().catch(() => {});
+        startupVerification ??= verifyBackend().catch(() => {});
         if (cfg.eagerStartupCheck) {
           await startupVerification;
           startupVerification = undefined;

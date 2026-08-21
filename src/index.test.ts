@@ -793,14 +793,14 @@ describe("redis-memory plugin — provider integration (Story 05)", () => {
   });
 
   test("eagerStartupCheck=false: stop() waits for the in-flight verification", async () => {
+    const order: string[] = [];
     let releaseHealthCheck!: () => void;
     const healthGate = new Promise<void>((resolve) => {
       releaseHealthCheck = resolve;
     });
-    let healthCheckSettled = false;
     const healthCheck = vi.fn(async () => {
       await healthGate;
-      healthCheckSettled = true;
+      order.push("health");
     });
     const provider = createFakeProvider({ healthCheck });
     const { services } = await registerWithFakeProvider(
@@ -809,20 +809,54 @@ describe("redis-memory plugin — provider integration (Story 05)", () => {
     );
 
     await services[0].start();
-    expect(healthCheckSettled).toBe(false);
-
-    // stop() must not resolve while verification is still in flight, otherwise
-    // an ensureView could write during teardown and log after "stopped".
-    let stopped = false;
     const stopping = services[0].stop().then(() => {
-      stopped = true;
+      order.push("stop");
     });
-    await Promise.resolve();
-    expect(stopped).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(order).toEqual([]);
 
     releaseHealthCheck();
     await stopping;
-    expect(healthCheckSettled).toBe(true);
+    expect(order).toEqual(["health", "stop"]);
+  });
+
+  test("eagerStartupCheck=false: a second start() reuses the in-flight verification", async () => {
+    // Re-assigning the tracked promise would leave the first verification
+    // running unreferenced, so stop() would wait only for the second and the
+    // first could log or ensureView after the plugin reported itself stopped.
+    const order: string[] = [];
+    let releaseHealthCheck!: () => void;
+    const healthGate = new Promise<void>((resolve) => {
+      releaseHealthCheck = resolve;
+    });
+    const healthCheck = vi.fn(async () => {
+      await healthGate;
+      order.push("health");
+    });
+    const provider = createFakeProvider({ healthCheck });
+    const { services } = await registerWithFakeProvider(
+      { ...SELF_HOSTED_CONFIG, eagerStartupCheck: false },
+      provider,
+    );
+
+    await services[0].start();
+    await services[0].start();
+    expect(healthCheck).toHaveBeenCalledTimes(1);
+
+    const stopping = services[0].stop().then(() => {
+      order.push("stop");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(order).toEqual([]);
+
+    releaseHealthCheck();
+    await stopping;
+    expect(order).toEqual(["health", "stop"]);
+
+    // stop() cleared the field, so the next start() verifies again.
+    await services[0].start();
+    expect(healthCheck).toHaveBeenCalledTimes(2);
   });
 
   test("eagerStartupCheck=false: a throwing logger does not escape as an unhandled rejection", async () => {
