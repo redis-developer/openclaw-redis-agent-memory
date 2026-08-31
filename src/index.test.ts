@@ -755,6 +755,138 @@ describe("redis-memory plugin — provider integration (Story 05)", () => {
     expect(logs.all.join("\n")).not.toContain("super-secret-key");
   });
 
+  test("service start awaits the health check by default", async () => {
+    const healthCheck = vi.fn(async () => {});
+    const provider = createFakeProvider({ healthCheck });
+    const { services } = await registerWithFakeProvider(SELF_HOSTED_CONFIG, provider);
+
+    await services[0].start();
+
+    expect(healthCheck).toHaveBeenCalledTimes(1);
+  });
+
+  test("eagerStartupCheck=false: service start returns while the health check is still pending", async () => {
+    let releaseHealthCheck!: () => void;
+    const healthGate = new Promise<void>((resolve) => {
+      releaseHealthCheck = resolve;
+    });
+    const healthCheck = vi.fn(async () => {
+      await healthGate;
+    });
+    const provider = createFakeProvider({ healthCheck });
+    const { services, logs } = await registerWithFakeProvider(
+      { ...SELF_HOSTED_CONFIG, eagerStartupCheck: false },
+      provider,
+    );
+
+    // Resolves immediately even though the health check is gated open; an
+    // awaited check would hang this call (and time the test out).
+    await services[0].start();
+    expect(healthCheck).toHaveBeenCalledTimes(1);
+    expect(logs.info.some((l) => l.includes("connected to server"))).toBe(false);
+
+    // The background check still completes and logs once released.
+    releaseHealthCheck();
+    await vi.waitFor(() =>
+      expect(logs.info.some((l) => l.includes("connected to server"))).toBe(true),
+    );
+  });
+
+  test("eagerStartupCheck=false: stop() waits for the in-flight verification", async () => {
+    const order: string[] = [];
+    let releaseHealthCheck!: () => void;
+    const healthGate = new Promise<void>((resolve) => {
+      releaseHealthCheck = resolve;
+    });
+    const healthCheck = vi.fn(async () => {
+      await healthGate;
+      order.push("health");
+    });
+    const provider = createFakeProvider({ healthCheck });
+    const { services } = await registerWithFakeProvider(
+      { ...SELF_HOSTED_CONFIG, eagerStartupCheck: false },
+      provider,
+    );
+
+    await services[0].start();
+    const stopping = services[0].stop().then(() => {
+      order.push("stop");
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(order).toEqual([]);
+
+    releaseHealthCheck();
+    await stopping;
+    expect(order).toEqual(["health", "stop"]);
+  });
+
+  test("eagerStartupCheck=false: a second start() reuses the in-flight verification", async () => {
+    // Re-assigning the tracked promise would leave the first verification
+    // running unreferenced, so stop() would wait only for the second and the
+    // first could log or ensureView after the plugin reported itself stopped.
+    const order: string[] = [];
+    let releaseHealthCheck!: () => void;
+    const healthGate = new Promise<void>((resolve) => {
+      releaseHealthCheck = resolve;
+    });
+    const healthCheck = vi.fn(async () => {
+      await healthGate;
+      order.push("health");
+    });
+    const provider = createFakeProvider({ healthCheck });
+    const { services } = await registerWithFakeProvider(
+      { ...SELF_HOSTED_CONFIG, eagerStartupCheck: false },
+      provider,
+    );
+
+    await services[0].start();
+    await services[0].start();
+    expect(healthCheck).toHaveBeenCalledTimes(1);
+
+    const stopping = services[0].stop().then(() => {
+      order.push("stop");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(order).toEqual([]);
+
+    releaseHealthCheck();
+    await stopping;
+    expect(order).toEqual(["health", "stop"]);
+
+    // stop() cleared the field, so the next start() verifies again.
+    await services[0].start();
+    expect(healthCheck).toHaveBeenCalledTimes(2);
+  });
+
+  test("eagerStartupCheck=false: a throwing logger does not escape as an unhandled rejection", async () => {
+    const provider = createFakeProvider({
+      healthCheck: vi.fn(async () => {
+        throw new Error("backend down");
+      }),
+    });
+    const { api, services } = await registerWithFakeProvider(
+      { ...SELF_HOSTED_CONFIG, eagerStartupCheck: false },
+      provider,
+    );
+    // The warn path inside verifyBackend's own catch block throws.
+    api.logger.warn = () => {
+      throw new Error("logger exploded");
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      await expect(services[0].start()).resolves.toBeUndefined();
+      await services[0].stop();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   test("self-hosted config logs 'backend: self-hosted' (no storeId)", async () => {
     const provider = createFakeProvider({
       capabilities: { summaryViews: true, extractionStrategy: true, similarityScores: true },

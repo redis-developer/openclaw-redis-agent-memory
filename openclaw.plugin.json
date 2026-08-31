@@ -65,6 +65,11 @@
       "label": "Auto-Recall",
       "help": "Automatically inject relevant memories into context"
     },
+    "eagerStartupCheck": {
+      "label": "Eager Startup Check",
+      "help": "Await the backend health check during service start. Disable on latency-sensitive hosts to run it in the background instead",
+      "advanced": true
+    },
     "assistantCapture": {
       "label": "Assistant Capture",
       "help": "Include assistant turns for memory extraction, or exclude them to minimize retained data",
@@ -181,6 +186,7 @@
       "timeout": { "type": "integer", "minimum": 100, "maximum": 120000 },
       "autoCapture": { "type": "boolean" },
       "autoRecall": { "type": "boolean" },
+      "eagerStartupCheck": { "type": "boolean" },
       "assistantCapture": { "type": "string", "enum": ["exclude", "include"] },
       "sensitiveDataRedaction": { "type": "boolean" },
       "sessionRetentionSeconds": { "type": "integer", "minimum": 60, "maximum": 31536000 },

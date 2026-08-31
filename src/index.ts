@@ -1223,27 +1223,58 @@ const redisMemoryPlugin: PluginDefinition = {
     // Service
     // ========================================================================
 
+    // The health check and summary-view ensures are informational network
+    // round-trips: a failure has never blocked startup (it only warns), and
+    // every tool call handles provider errors on its own. With
+    // eagerStartupCheck=false they run in the background so hosts that gate
+    // readiness on service start (e.g. warm pools) are not delayed by them.
+    const verifyBackend = async () => {
+      try {
+        await provider.healthCheck();
+        api.logger.info?.(
+          `redis-memory: connected to server (${cfg.serverUrl}, namespace: ${JSON.stringify(cfg.namespace ?? "default")})`,
+        );
+
+        if (provider.capabilities.summaryViews) {
+          for (const scope of getConfiguredScopes(cfg)) {
+            await provider.summaries?.ensureView(scope);
+          }
+        }
+      } catch (err) {
+        api.logger.warn(
+          `redis-memory: server not reachable at ${cfg.serverUrl}: ${safeErrorMessage(err, sensitiveValues)}`,
+        );
+      }
+    };
+
+    // Tracked so a deferred verification cannot outlive the plugin: an
+    // in-flight ensureView would otherwise write during teardown, and its log
+    // line would land after "stopped".
+    let startupVerification: Promise<void> | undefined;
+
     api.registerService({
       id: "redis-memory",
       start: async () => {
-        try {
-          await provider.healthCheck();
-          api.logger.info?.(
-            `redis-memory: connected to server (${cfg.serverUrl}, namespace: ${JSON.stringify(cfg.namespace ?? "default")})`,
-          );
-
-          if (provider.capabilities.summaryViews) {
-            for (const scope of getConfiguredScopes(cfg)) {
-              await provider.summaries?.ensureView(scope);
-            }
-          }
-        } catch (err) {
-          api.logger.warn(
-            `redis-memory: server not reachable at ${cfg.serverUrl}: ${safeErrorMessage(err, sensitiveValues)}`,
-          );
+        // The .catch is belt and braces: verifyBackend already swallows
+        // provider errors, but a throw from the logger inside its own catch
+        // block would otherwise escape as an unhandled rejection, which is
+        // fatal under Node's default --unhandled-rejections=throw.
+        startupVerification ??= verifyBackend().catch(() => {});
+        if (cfg.eagerStartupCheck) {
+          await startupVerification;
+          startupVerification = undefined;
         }
       },
       stop: async () => {
+        if (startupVerification) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timedOut = new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, 5000);
+          });
+          await Promise.race([startupVerification, timedOut]);
+          if (timer) clearTimeout(timer);
+          startupVerification = undefined;
+        }
         await captureCoordinator.drain(5000);
         api.logger.info?.("redis-memory: stopped");
       },

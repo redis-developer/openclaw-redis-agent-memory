@@ -9,7 +9,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
-import { parseMemoryConfig } from "./config.js";
+import { ALLOWED_CONFIG_KEYS, parseMemoryConfig } from "./config.js";
 
 const ENV_KEYS = [
   "AGENT_MEMORY_ENDPOINT",
@@ -112,9 +112,27 @@ describe("parseMemoryConfig — provider resolution", () => {
     });
   });
 
+  test("manifest configSchema stays in lockstep with parser-accepted keys", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const manifest = JSON.parse(
+      await readFile(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    );
+    const manifestKeys = Object.keys(manifest.configSchema.properties).sort();
+    expect(manifestKeys).toEqual([...ALLOWED_CONFIG_KEYS].sort());
+  });
+
+  test("eagerStartupCheck defaults to true and accepts false", () => {
+    expect(parseMemoryConfig({ serverUrl: "http://localhost:8000" }).eagerStartupCheck).toBe(true);
+    expect(
+      parseMemoryConfig({ serverUrl: "http://localhost:8000", eagerStartupCheck: false })
+        .eagerStartupCheck,
+    ).toBe(false);
+  });
+
   test.each([
     [{ assistantCapture: "sometimes" }, /assistantCapture must be exclude or include/],
     [{ sensitiveDataRedaction: "yes" }, /sensitiveDataRedaction must be a boolean/],
+    [{ eagerStartupCheck: "yes" }, /eagerStartupCheck must be a boolean/],
     [{ sessionRetentionSeconds: 59 }, /sessionRetentionSeconds must be between 60/],
     [{ recallRecordMaxChars: 127 }, /recallRecordMaxChars must be between 128/],
     [{ recallContextMaxChars: 1000 }, /recallContextMaxChars must be between 1024/],
